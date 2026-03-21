@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Read-only memory mapping of an entire file.
 ///
@@ -18,7 +19,7 @@ use std::path::Path;
 /// issues; concurrent writers to the same file are not supported by this API.
 pub struct MmapFile {
     _file: File,
-    mmap: memmap2::Mmap,
+    mmap: Arc<memmap2::Mmap>,
 }
 
 impl MmapFile {
@@ -31,7 +32,7 @@ impl MmapFile {
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         Ok(Self {
             _file: file,
-            mmap,
+            mmap: Arc::new(mmap),
         })
     }
 
@@ -39,6 +40,13 @@ impl MmapFile {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         self.mmap.as_ref()
+    }
+
+    /// Returns a clone of the underlying mapping so derived buffers can keep it alive
+    /// even after `MmapFile` is dropped.
+    #[inline]
+    pub fn mmap_arc(&self) -> Arc<memmap2::Mmap> {
+        self.mmap.clone()
     }
 }
 

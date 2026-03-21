@@ -8,3 +8,12 @@ rust-version.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+arrow-array = "54.3.1"
+arrow-buffer = "54.3.1"
+arrow-schema = "54.3.1"
+arrow-data = "54.3.1"
+columnar-format = { path = "../columnar-format" }
+columnar-mmap = { path = "../columnar-mmap" }
+memmap2 = "0.9.10"
