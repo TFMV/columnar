@@ -1,0 +1,2 @@
+# columnar
+Embeddable OLAP Database
