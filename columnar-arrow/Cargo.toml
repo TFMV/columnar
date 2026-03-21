@@ -1,0 +1,10 @@
+[package]
+name = "columnar-arrow"
+description = "Bridge between Columnar mmap/layout and Apache Arrow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
