@@ -1,0 +1,12 @@
+[package]
+name = "columnar-cli"
+description = "Optional command-line interface for Columnar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+default-run = "columnar-cli"
+
+[[bin]]
+name = "columnar-cli"
+path = "src/main.rs"
