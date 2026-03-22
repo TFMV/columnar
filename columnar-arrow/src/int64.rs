@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow_array::Int64Array;
 use arrow_buffer::alloc::Allocation as ArrowAllocation;
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
+use bytes::Bytes;
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType};
 use memmap2::Mmap;
@@ -116,7 +117,7 @@ unsafe fn buffer_from_mmap_slice(
     slice: &[u8],
 ) -> Result<Buffer, ArrowBuildError> {
     if slice.is_empty() {
-        return Ok(Buffer::from_vec(Vec::<u8>::new()));
+        return Ok(Buffer::from(Bytes::new()));
     }
 
     let ptr = std::ptr::NonNull::new(slice.as_ptr() as *mut u8).ok_or(
@@ -408,4 +409,3 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 }
-
