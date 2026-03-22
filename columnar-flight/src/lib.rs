@@ -449,6 +449,8 @@ impl FlightSqlService for ColumnarFlightSqlServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
     use arrow_array::{Array, Int64Array, RecordBatch};
     use arrow_flight::flight_service_client::FlightServiceClient;
     use arrow_flight::sql::client::FlightSqlServiceClient;
@@ -457,6 +459,7 @@ mod tests {
     use datafusion::datasource::MemTable;
     use futures::{StreamExt, TryStreamExt};
     use prost::Message;
+    use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio::time::{sleep, Duration};
@@ -533,6 +536,86 @@ mod tests {
         });
 
         (format!("http://{addr}"), shutdown_tx, handle)
+    }
+
+    fn go_proxy_url() -> Option<String> {
+        let output = Command::new("go")
+            .args(["env", "GOMODCACHE"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let module_cache = String::from_utf8(output.stdout).ok()?;
+        let module_cache = module_cache.trim();
+        if module_cache.is_empty() {
+            return None;
+        }
+
+        Some(format!("file://{module_cache}/cache/download"))
+    }
+
+    fn run_go_interop_client(endpoint: &str, query: &str) -> Result<String, String> {
+        let go_proxy = go_proxy_url().ok_or_else(|| "go toolchain unavailable".to_string())?;
+        let endpoint = endpoint
+            .strip_prefix("http://")
+            .ok_or_else(|| format!("unexpected endpoint format: {endpoint}"))?;
+        let cache_dir = TempDir::new().map_err(|error| format!("tempdir: {error}"))?;
+        let module_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("go-flight-sql-client");
+        let module_cache = cache_dir.path().join("gomodcache");
+        let build_cache = cache_dir.path().join("gocache");
+        std::fs::create_dir_all(&module_cache)
+            .map_err(|error| format!("create module cache: {error}"))?;
+        std::fs::create_dir_all(&build_cache)
+            .map_err(|error| format!("create build cache: {error}"))?;
+
+        let mut download = Command::new("go");
+        download
+            .current_dir(&module_dir)
+            .arg("mod")
+            .arg("download")
+            .env("GOMODCACHE", &module_cache)
+            .env("GOCACHE", &build_cache)
+            .env("GOPROXY", &go_proxy)
+            .env("GOSUMDB", "off")
+            .env("GOFLAGS", "-buildvcs=false");
+        let download_output = download
+            .output()
+            .map_err(|error| format!("go mod download failed to start: {error}"))?;
+        if !download_output.status.success() {
+            return Err(format!(
+                "go mod download failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&download_output.stdout),
+                String::from_utf8_lossy(&download_output.stderr)
+            ));
+        }
+
+        let mut run = Command::new("go");
+        run.current_dir(&module_dir)
+            .arg("run")
+            .arg(".")
+            .arg(endpoint)
+            .arg(query)
+            .env("GOMODCACHE", &module_cache)
+            .env("GOCACHE", &build_cache)
+            .env("GOPROXY", &go_proxy)
+            .env("GOSUMDB", "off")
+            .env("GOFLAGS", "-buildvcs=false");
+        let output = run
+            .output()
+            .map_err(|error| format!("go run failed to start: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "go run failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        String::from_utf8(output.stdout).map_err(|error| format!("stdout utf8: {error}"))
     }
 
     #[test]
@@ -759,6 +842,56 @@ mod tests {
 
         assert!(batch_count >= 4);
         assert_eq!(total_rows, 8_192);
+
+        let _ = shutdown_tx.send(());
+        server_task.await.expect("server shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn go_flight_sql_client_executes_query_and_preserves_arrow_data() {
+        if Command::new("go").arg("version").output().is_err() {
+            eprintln!("skipping Go interoperability test because go is unavailable");
+            return;
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(arrow_array::StringArray::from(vec![
+                    Some("one"),
+                    Some(""),
+                    Some("three"),
+                    None,
+                ])),
+            ],
+        )
+        .expect("build interop batch");
+        let context = Arc::new(SessionContext::new());
+        context
+            .register_batch("numbers", batch)
+            .expect("register batch");
+
+        let service = ColumnarFlightSqlServer::new(context);
+        let (endpoint, shutdown_tx, server_task) = start_test_server(service).await;
+        let query = "SELECT a, s FROM numbers WHERE a >= 2 ORDER BY a";
+        let endpoint_for_client = endpoint.clone();
+        let query_for_client = query.to_string();
+        let output = tokio::task::spawn_blocking(move || {
+            run_go_interop_client(&endpoint_for_client, &query_for_client)
+        })
+        .await
+        .expect("join Go Flight SQL client task")
+        .expect("Go Flight SQL client should validate query results");
+
+        assert!(
+            output.contains("ok batches=1 rows=3"),
+            "unexpected output: {output}"
+        );
 
         let _ = shutdown_tx.send(());
         server_task.await.expect("server shutdown");
