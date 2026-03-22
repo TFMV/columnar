@@ -5,7 +5,7 @@
 //! §1.3), writes payload, then **patches** directory bytes and the header.
 
 use crate::align::align_offset;
-use crate::directory::{ColumnDirectory, ColumnMeta, COLUMN_META_LEN};
+use crate::directory::{ColumnMeta, COLUMN_META_LEN};
 use crate::header::{
     FileHeader, FILE_HEADER_LEN, FILE_HEADER_MAGIC, FILE_HEADER_ON_DISK_SIZE, FILE_HEADER_VERSION,
 };
@@ -221,9 +221,13 @@ impl ColumnarWriter {
         if end > self.buf.len() {
             return Err(ColumnarWriteError::State("directory patch past end of buffer"));
         }
-        let dir = ColumnDirectory::new(entries.to_vec());
-        dir.serialize_into(&mut self.buf[self.dir_start..end])
-            .map_err(|_| ColumnarWriteError::State("directory serialize_into failed"))?;
+        for (index, entry) in entries.iter().enumerate() {
+            let start = self.dir_start + index * COLUMN_META_LEN;
+            let entry_end = start + COLUMN_META_LEN;
+            entry
+                .serialize_into(&mut self.buf[start..entry_end])
+                .map_err(|_| ColumnarWriteError::State("directory serialize_into failed"))?;
+        }
         self.dir_patched = true;
         Ok(())
     }

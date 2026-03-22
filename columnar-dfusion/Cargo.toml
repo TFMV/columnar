@@ -16,6 +16,7 @@ async-trait = "0.1.89"
 columnar-arrow = { path = "../columnar-arrow" }
 columnar-format = { path = "../columnar-format" }
 datafusion = "46.0.1"
+datafusion-datasource = "46.0.1"
 datafusion-expr = "46.0.1"
 memmap2 = "0.9.10"
 
