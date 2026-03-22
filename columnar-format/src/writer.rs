@@ -10,6 +10,7 @@ use crate::header::{
     FileHeader, FILE_FLAG_VALUES_ALIGNED_64, FILE_HEADER_LEN, FILE_HEADER_MAGIC,
     FILE_HEADER_ON_DISK_SIZE, FILE_HEADER_VERSION,
 };
+use crate::stats::Int64Stats;
 
 /// Preferred alignment for fixed-width **values** buffers (format §1.3).
 pub const VALUES_BUFFER_ALIGN: usize = 64;
@@ -58,13 +59,45 @@ pub enum ColumnarWriteError {
     /// `reserve_column_directory` was given `columns == 0`.
     ZeroColumns,
     /// `patch_column_directory` entry count does not match the reserved size.
-    DirectoryColumnMismatch { reserved: usize, got: usize },
+    DirectoryColumnMismatch {
+        reserved: usize,
+        got: usize,
+    },
     /// `write_fixed_width_values` when `values.len()` is not a multiple of `element_width`.
-    ValuesLengthNotMultiple { len: usize, element_width: usize },
+    ValuesLengthNotMultiple {
+        len: usize,
+        element_width: usize,
+    },
     /// `element_width == 0` in `write_fixed_width_values`.
     ZeroElementWidth,
     /// `usize` overflow sizing the directory.
     SizeOverflow,
+    InvalidValidityLength {
+        rows: usize,
+        got_bytes: usize,
+        needed_bytes: usize,
+    },
+    InvalidOffsetsLength {
+        got: usize,
+        offset_width: usize,
+    },
+    OffsetsTooShort {
+        got_bytes: usize,
+        needed_bytes: usize,
+    },
+    OffsetsMustStartAtZero {
+        got: i64,
+    },
+    OffsetsNotMonotonic {
+        index: usize,
+        previous: i64,
+        current: i64,
+    },
+    OffsetOutOfBounds {
+        index: usize,
+        offset: i64,
+        values_len: usize,
+    },
     /// `data_offset` in a directory entry does not satisfy the configured values alignment.
     MisalignedDataOffset {
         column_index: usize,
@@ -89,6 +122,44 @@ impl core::fmt::Display for ColumnarWriteError {
             ),
             ColumnarWriteError::ZeroElementWidth => write!(f, "element width must be non-zero"),
             ColumnarWriteError::SizeOverflow => write!(f, "size calculation overflow"),
+            ColumnarWriteError::InvalidValidityLength {
+                rows,
+                got_bytes,
+                needed_bytes,
+            } => write!(
+                f,
+                "validity bitmap for {rows} rows is too short: got {got_bytes} bytes, need at least {needed_bytes}"
+            ),
+            ColumnarWriteError::InvalidOffsetsLength { got, offset_width } => write!(
+                f,
+                "offsets length {got} is not a multiple of offset width {offset_width}"
+            ),
+            ColumnarWriteError::OffsetsTooShort {
+                got_bytes,
+                needed_bytes,
+            } => write!(
+                f,
+                "offsets buffer is too short: got {got_bytes} bytes, need at least {needed_bytes}"
+            ),
+            ColumnarWriteError::OffsetsMustStartAtZero { got } => {
+                write!(f, "offsets must start at zero, got {got}")
+            }
+            ColumnarWriteError::OffsetsNotMonotonic {
+                index,
+                previous,
+                current,
+            } => write!(
+                f,
+                "offset {index} is not monotonic: previous {previous}, current {current}"
+            ),
+            ColumnarWriteError::OffsetOutOfBounds {
+                index,
+                offset,
+                values_len,
+            } => write!(
+                f,
+                "offset {index} value {offset} exceeds values length {values_len}"
+            ),
             ColumnarWriteError::MisalignedDataOffset {
                 column_index,
                 offset,
@@ -280,6 +351,92 @@ impl ColumnarWriter {
         self.write_fixed_width_values(values, element_width)
     }
 
+    /// Writes a single `Int64` column chunk, including optional stats and validity.
+    pub fn write_int64_column_chunk(
+        &mut self,
+        column_id: u32,
+        logical_type: u32,
+        values: &[u8],
+        validity: Option<&[u8]>,
+        stats: Option<Int64Stats>,
+    ) -> Result<ColumnMeta, ColumnarWriteError> {
+        if values.len() % std::mem::size_of::<i64>() != 0 {
+            return Err(ColumnarWriteError::ValuesLengthNotMultiple {
+                len: values.len(),
+                element_width: std::mem::size_of::<i64>(),
+            });
+        }
+        let rows = values.len() / std::mem::size_of::<i64>();
+        validate_validity(validity, rows)?;
+
+        let (stats_offset, stats_length) = if let Some(stats) = stats {
+            self.write_optional_buffer(Some(&stats.serialize()), std::mem::size_of::<u64>())?
+        } else {
+            (0, 0)
+        };
+        let (validity_offset, validity_length) = self.write_optional_buffer(validity, 1)?;
+        let (data_offset, data_length) =
+            self.write_values_buffer(values, std::mem::size_of::<i64>())?;
+
+        Ok(ColumnMeta {
+            column_id,
+            physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
+            logical_type,
+            data_offset,
+            data_length,
+            validity_offset,
+            validity_length,
+            offsets_offset: 0,
+            offsets_length: 0,
+            stats_offset,
+            stats_length,
+        })
+    }
+
+    /// Writes a single `Utf8` column chunk with 4-byte offsets, plus optional validity and stats.
+    pub fn write_utf8_i32_column_chunk(
+        &mut self,
+        column_id: u32,
+        logical_type: u32,
+        offsets: &[u8],
+        values: &[u8],
+        validity: Option<&[u8]>,
+        stats: Option<&[u8]>,
+    ) -> Result<ColumnMeta, ColumnarWriteError> {
+        self.write_utf8_column_chunk(
+            column_id,
+            logical_type,
+            V0_PHYSICAL_UTF8_I32,
+            offsets,
+            std::mem::size_of::<i32>(),
+            values,
+            validity,
+            stats,
+        )
+    }
+
+    /// Writes a single `LargeUtf8` column chunk with 8-byte offsets, plus optional validity and stats.
+    pub fn write_utf8_i64_column_chunk(
+        &mut self,
+        column_id: u32,
+        logical_type: u32,
+        offsets: &[u8],
+        values: &[u8],
+        validity: Option<&[u8]>,
+        stats: Option<&[u8]>,
+    ) -> Result<ColumnMeta, ColumnarWriteError> {
+        self.write_utf8_column_chunk(
+            column_id,
+            logical_type,
+            V0_PHYSICAL_UTF8_I64,
+            offsets,
+            std::mem::size_of::<i64>(),
+            values,
+            validity,
+            stats,
+        )
+    }
+
     /// Overwrites the reserved directory region with serialized [`ColumnMeta`] entries.
     pub fn patch_column_directory(
         &mut self,
@@ -393,6 +550,174 @@ impl ColumnarWriter {
     pub fn directory_column_count(&self) -> usize {
         self.dir_columns
     }
+
+    fn write_utf8_column_chunk(
+        &mut self,
+        column_id: u32,
+        logical_type: u32,
+        physical_type: u32,
+        offsets: &[u8],
+        offset_width: usize,
+        values: &[u8],
+        validity: Option<&[u8]>,
+        stats: Option<&[u8]>,
+    ) -> Result<ColumnMeta, ColumnarWriteError> {
+        let rows = validate_offsets(offsets, offset_width, values.len())?;
+        validate_validity(validity, rows)?;
+
+        let (stats_offset, stats_length) =
+            self.write_optional_buffer(stats, std::mem::size_of::<u64>())?;
+        let (validity_offset, validity_length) = self.write_optional_buffer(validity, 1)?;
+        let (offsets_offset, offsets_length) =
+            self.write_optional_aligned_buffer(offsets, offset_width)?;
+        let (data_offset, data_length) = self.write_values_buffer(values, 1)?;
+
+        Ok(ColumnMeta {
+            column_id,
+            physical_type,
+            logical_type,
+            data_offset,
+            data_length,
+            validity_offset,
+            validity_length,
+            offsets_offset,
+            offsets_length,
+            stats_offset,
+            stats_length,
+        })
+    }
+
+    fn write_optional_buffer(
+        &mut self,
+        bytes: Option<&[u8]>,
+        element_width: usize,
+    ) -> Result<(u64, u64), ColumnarWriteError> {
+        let Some(bytes) = bytes else {
+            return Ok((0, 0));
+        };
+        self.write_optional_aligned_buffer(bytes, element_width)
+    }
+
+    fn write_optional_aligned_buffer(
+        &mut self,
+        bytes: &[u8],
+        element_width: usize,
+    ) -> Result<(u64, u64), ColumnarWriteError> {
+        self.pad_to_alignment(SECTION_ALIGN)?;
+        self.write_fixed_width_values(bytes, element_width)
+    }
+}
+
+fn validate_validity(validity: Option<&[u8]>, rows: usize) -> Result<(), ColumnarWriteError> {
+    let Some(validity) = validity else {
+        return Ok(());
+    };
+    let needed_bytes = rows.div_ceil(8);
+    if validity.len() < needed_bytes {
+        return Err(ColumnarWriteError::InvalidValidityLength {
+            rows,
+            got_bytes: validity.len(),
+            needed_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_offsets(
+    offsets: &[u8],
+    offset_width: usize,
+    values_len: usize,
+) -> Result<usize, ColumnarWriteError> {
+    if offsets.len() % offset_width != 0 {
+        return Err(ColumnarWriteError::InvalidOffsetsLength {
+            got: offsets.len(),
+            offset_width,
+        });
+    }
+    if offsets.len() < offset_width {
+        return Err(ColumnarWriteError::OffsetsTooShort {
+            got_bytes: offsets.len(),
+            needed_bytes: offset_width,
+        });
+    }
+
+    match offset_width {
+        4 => validate_i32_offsets(offsets, values_len),
+        8 => validate_i64_offsets(offsets, values_len),
+        _ => Err(ColumnarWriteError::State("unsupported offset width")),
+    }
+}
+
+fn validate_i32_offsets(offsets: &[u8], values_len: usize) -> Result<usize, ColumnarWriteError> {
+    let mut chunks = offsets.chunks_exact(std::mem::size_of::<i32>());
+    let first = i32::from_le_bytes(
+        chunks
+            .next()
+            .expect("validated offsets length")
+            .try_into()
+            .expect("i32 chunk"),
+    ) as i64;
+    if first != 0 {
+        return Err(ColumnarWriteError::OffsetsMustStartAtZero { got: first });
+    }
+    let mut previous = first;
+    let mut rows = 0usize;
+    for (index, chunk) in chunks.enumerate() {
+        let current = i32::from_le_bytes(chunk.try_into().expect("i32 chunk")) as i64;
+        if current < previous {
+            return Err(ColumnarWriteError::OffsetsNotMonotonic {
+                index: index + 1,
+                previous,
+                current,
+            });
+        }
+        if current as usize > values_len {
+            return Err(ColumnarWriteError::OffsetOutOfBounds {
+                index: index + 1,
+                offset: current,
+                values_len,
+            });
+        }
+        previous = current;
+        rows += 1;
+    }
+    Ok(rows)
+}
+
+fn validate_i64_offsets(offsets: &[u8], values_len: usize) -> Result<usize, ColumnarWriteError> {
+    let mut chunks = offsets.chunks_exact(std::mem::size_of::<i64>());
+    let first = i64::from_le_bytes(
+        chunks
+            .next()
+            .expect("validated offsets length")
+            .try_into()
+            .expect("i64 chunk"),
+    );
+    if first != 0 {
+        return Err(ColumnarWriteError::OffsetsMustStartAtZero { got: first });
+    }
+    let mut previous = first;
+    let mut rows = 0usize;
+    for (index, chunk) in chunks.enumerate() {
+        let current = i64::from_le_bytes(chunk.try_into().expect("i64 chunk"));
+        if current < previous {
+            return Err(ColumnarWriteError::OffsetsNotMonotonic {
+                index: index + 1,
+                previous,
+                current,
+            });
+        }
+        if current as usize > values_len {
+            return Err(ColumnarWriteError::OffsetOutOfBounds {
+                index: index + 1,
+                offset: current,
+                values_len,
+            });
+        }
+        previous = current;
+        rows += 1;
+    }
+    Ok(rows)
 }
 
 fn infer_chunk_layout(entries: &[ColumnMeta]) -> Result<(usize, usize), &'static str> {
@@ -415,4 +740,116 @@ fn infer_chunk_layout(entries: &[ColumnMeta]) -> Result<(usize, usize), &'static
         }
     }
     Ok((logical_column_count, entries.len() / logical_column_count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ColumnarReader, Int64Stats};
+
+    fn encode_validity(mask: &[bool]) -> Vec<u8> {
+        let mut bitmap = vec![0u8; mask.len().div_ceil(8)];
+        for (index, valid) in mask.iter().copied().enumerate() {
+            if valid {
+                bitmap[index / 8] |= 1u8 << (index % 8);
+            }
+        }
+        bitmap
+    }
+
+    #[test]
+    fn write_int64_column_chunk_round_trips_validity_and_stats() {
+        let mut writer = ColumnarWriter::new();
+        writer.write_header_placeholder().unwrap();
+        writer.write_schema_block(b"schema").unwrap();
+        writer.reserve_column_directory(1).unwrap();
+
+        let values: Vec<u8> = [1i64, 2, 3]
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let validity = encode_validity(&[true, false, true]);
+        let meta = writer
+            .write_int64_column_chunk(
+                0,
+                0,
+                &values,
+                Some(&validity),
+                Some(Int64Stats {
+                    min: Some(1),
+                    max: Some(3),
+                    null_count: 1,
+                    distinct_count: Some(2),
+                }),
+            )
+            .unwrap();
+
+        writer
+            .patch_column_directory(std::slice::from_ref(&meta))
+            .unwrap();
+        writer.finalize_header().unwrap();
+
+        let reader = ColumnarReader::new(writer.as_slice()).unwrap();
+        assert_eq!(reader.column_values(0).unwrap(), values.as_slice());
+        assert_eq!(
+            reader.column_validity(0).unwrap().unwrap(),
+            validity.as_slice()
+        );
+        assert_eq!(
+            reader.column_int64_stats(0).unwrap().unwrap(),
+            Int64Stats {
+                min: Some(1),
+                max: Some(3),
+                null_count: 1,
+                distinct_count: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn write_utf8_i32_column_chunk_round_trips_offsets_values_and_nulls() {
+        let mut writer = ColumnarWriter::new();
+        writer.write_header_placeholder().unwrap();
+        writer.write_schema_block(b"schema").unwrap();
+        writer.reserve_column_directory(1).unwrap();
+
+        let offsets: Vec<u8> = [0i32, 5, 5, 9]
+            .into_iter()
+            .flat_map(|offset| offset.to_le_bytes())
+            .collect();
+        let values = b"alphabeta";
+        let validity = encode_validity(&[true, false, true]);
+
+        let meta = writer
+            .write_utf8_i32_column_chunk(0, 0, &offsets, values, Some(&validity), None)
+            .unwrap();
+
+        writer
+            .patch_column_directory(std::slice::from_ref(&meta))
+            .unwrap();
+        writer.finalize_header().unwrap();
+
+        let reader = ColumnarReader::new(writer.as_slice()).unwrap();
+        let column = reader.variable_column_buffers(0).unwrap();
+        assert_eq!(column.offsets, offsets.as_slice());
+        assert_eq!(column.values, values);
+        assert_eq!(column.validity.unwrap(), validity.as_slice());
+    }
+
+    #[test]
+    fn write_utf8_chunk_rejects_out_of_bounds_offsets() {
+        let mut writer = ColumnarWriter::new();
+        writer.write_header_placeholder().unwrap();
+        writer.write_schema_block(b"schema").unwrap();
+        writer.reserve_column_directory(1).unwrap();
+
+        let offsets: Vec<u8> = [0i32, 99]
+            .into_iter()
+            .flat_map(|offset| offset.to_le_bytes())
+            .collect();
+        let err = writer
+            .write_utf8_i32_column_chunk(0, 0, &offsets, b"abc", None, None)
+            .unwrap_err();
+        assert!(matches!(err, ColumnarWriteError::OffsetOutOfBounds { .. }));
+    }
 }

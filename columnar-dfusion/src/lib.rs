@@ -694,9 +694,7 @@ mod tests {
     use super::*;
     use arrow_array::{Array, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use columnar_format::{
-        ColumnMeta, ColumnarWriter, Int64Stats, MIN_BUFFER_ALIGN, VALUES_BUFFER_ALIGN,
-    };
+    use columnar_format::{ColumnarWriter, Int64Stats};
     use columnar_mmap::MmapFile;
     use datafusion::prelude::SessionContext;
     use datafusion_common::stats::Precision;
@@ -709,11 +707,11 @@ mod tests {
             .collect()
     }
 
-    fn stats_bytes(values: &[i64]) -> [u8; Int64Stats::SERIALIZED_LEN] {
-        let stats = Int64Stats {
+    fn stats_for(values: &[i64], null_count: u64) -> Int64Stats {
+        Int64Stats {
             min: values.iter().min().copied(),
             max: values.iter().max().copied(),
-            null_count: 0,
+            null_count,
             distinct_count: Some(
                 values
                     .iter()
@@ -721,8 +719,7 @@ mod tests {
                     .collect::<std::collections::BTreeSet<_>>()
                     .len() as u64,
             ),
-        };
-        stats.serialize()
+        }
     }
 
     fn write_test_file(columns: &[&[i64]]) -> NamedTempFile {
@@ -730,6 +727,26 @@ mod tests {
     }
 
     fn write_chunked_test_file(chunks: &[&[&[i64]]]) -> NamedTempFile {
+        let chunk_specs: Vec<Vec<(&[i64], Option<Vec<bool>>)>> = chunks
+            .iter()
+            .map(|chunk| chunk.iter().map(|values| (*values, None)).collect())
+            .collect();
+        write_chunked_nullable_test_file(&chunk_specs)
+    }
+
+    fn encode_validity(mask: &[bool]) -> Vec<u8> {
+        let mut bitmap = vec![0u8; mask.len().div_ceil(8)];
+        for (index, valid) in mask.iter().copied().enumerate() {
+            if valid {
+                bitmap[index / 8] |= 1u8 << (index % 8);
+            }
+        }
+        bitmap
+    }
+
+    fn write_chunked_nullable_test_file(
+        chunks: &[Vec<(&[i64], Option<Vec<bool>>)>],
+    ) -> NamedTempFile {
         assert!(!chunks.is_empty());
         let column_count = chunks[0].len();
         assert!(column_count > 0);
@@ -750,36 +767,24 @@ mod tests {
 
         let mut metas = Vec::with_capacity(chunks.len() * column_count);
         for chunk in chunks {
-            for (index, values) in chunk.iter().enumerate() {
-                writer
-                    .pad_to_alignment(MIN_BUFFER_ALIGN as usize)
-                    .expect("align stats");
-                let stats = stats_bytes(values);
-                let (stats_offset, stats_length) = writer
-                    .write_fixed_width_values(&stats, std::mem::size_of::<i64>())
-                    .expect("write stats");
-
-                writer
-                    .pad_to_alignment(VALUES_BUFFER_ALIGN)
-                    .expect("align values");
+            for (index, (values, validity)) in chunk.iter().enumerate() {
                 let encoded = encode_i64(values);
-                let (data_offset, data_length) = writer
-                    .write_fixed_width_values(&encoded, std::mem::size_of::<i64>())
-                    .expect("write values");
-
-                metas.push(ColumnMeta {
-                    column_id: index as u32,
-                    physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-                    logical_type: 0,
-                    data_offset,
-                    data_length,
-                    validity_offset: 0,
-                    validity_length: 0,
-                    offsets_offset: 0,
-                    offsets_length: 0,
-                    stats_offset,
-                    stats_length,
-                });
+                let validity_bytes = validity.as_ref().map(|mask| encode_validity(mask));
+                let null_count = validity
+                    .as_ref()
+                    .map(|mask| mask.iter().filter(|valid| !**valid).count() as u64)
+                    .unwrap_or(0);
+                metas.push(
+                    writer
+                        .write_int64_column_chunk(
+                            index as u32,
+                            0,
+                            &encoded,
+                            validity_bytes.as_deref(),
+                            Some(stats_for(values, null_count)),
+                        )
+                        .expect("write int64 chunk"),
+                );
             }
         }
 
@@ -795,8 +800,8 @@ mod tests {
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-            Field::new("b", DataType::Int64, false),
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
         ]))
     }
 
@@ -961,6 +966,41 @@ mod tests {
             })
             .collect();
         assert_eq!(b_values, vec![1000, 2000, 3000]);
+    }
+
+    #[tokio::test]
+    async fn writer_end_to_end_write_read_query_with_nulls_and_multiple_chunks() {
+        let file = write_chunked_nullable_test_file(&[
+            vec![(&[1, 2, 3], None), (&[10, 20, 30], None)],
+            vec![
+                (&[10, 20, 30], Some(vec![false, true, true])),
+                (&[100, 200, 300], None),
+            ],
+        ]);
+        let mmap = MmapFile::open(file.path()).expect("mmap");
+        let provider =
+            Arc::new(ColumnarTableProvider::try_new(mmap.mmap_arc(), schema()).expect("provider"));
+        let metrics = provider.metrics();
+
+        let batches = collect_query("SELECT b FROM t WHERE a >= 10 ORDER BY a", provider).await;
+
+        assert_eq!(metrics.chunks_pruned(), 1);
+        assert_eq!(metrics.data_buffers_read(), 2);
+
+        let b_values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 array");
+                (0..array.len())
+                    .map(|index| array.value(index))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(b_values, vec![200, 300]);
     }
 
     #[tokio::test]
