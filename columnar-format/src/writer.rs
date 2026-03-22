@@ -1,4 +1,4 @@
-'''//! Build a v0 `.columnar` file: header, schema, column directory, then column buffers.
+//! Build a v0 `.columnar` file: header, schema, column directory, then column buffers.
 //!
 //! On-disk section order matches format §2.1: **header → schema → directory → chunks**. The writer
 //! reserves the directory after the schema, aligns for the values buffer (64-byte preferred per
@@ -892,4 +892,3 @@ mod tests {
         assert!(matches!(err, ColumnarWriteError::OffsetOutOfBounds { .. }));
     }
 }
-''

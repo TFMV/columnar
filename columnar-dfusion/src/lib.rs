@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
-use columnar_arrow::{build_int64_array_from_mmap, ArrowBuildError};
+use columnar_arrow::build_int64_array;
+use columnar_arrow::buffer::ArrowBuildError;
 use columnar_format::{ColumnarReadError, ColumnarReader, Int64Stats, V0_PHYSICAL_FIXED_WIDTH_I64};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, ScalarValue};
@@ -250,7 +251,7 @@ impl ColumnarDataSource {
                 .fetch_add(1, Ordering::Relaxed);
             let values = reader.chunk_column_values(chunk_index, index)?;
             let validity = reader.chunk_column_validity(chunk_index, index)?;
-            let array = build_int64_array_from_mmap(self.mmap.clone(), values, validity)?;
+            let array = build_int64_array(self.mmap.clone(), values, validity)?;
             columns.push(Arc::new(array) as ArrayRef);
         }
 

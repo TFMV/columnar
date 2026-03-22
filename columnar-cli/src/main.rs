@@ -1,4 +1,4 @@
-'''use std::fs::File;
+use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::{env, process};
@@ -33,4 +33,3 @@ fn main() {
     let path = PathBuf::from(&args[2]);
     inspect(path);
 }
-''
