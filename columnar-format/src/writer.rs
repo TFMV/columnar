@@ -1,4 +1,4 @@
-'''//! Build a v0 `.columnar` file: header, schema, column directory, then column buffers.
+//! Build a v0 `.columnar` file: header, schema, column directory, then column buffers.
 //!
 //! On-disk section order matches format §2.1: **header → schema → directory → chunks**. The writer
 //! reserves the directory after the schema, aligns for the values buffer (64-byte preferred per
@@ -11,19 +11,13 @@ use crate::header::{
     FILE_HEADER_ON_DISK_SIZE, FILE_HEADER_VERSION,
 };
 use crate::stats::Int64Stats;
+use crate::types::ColumnarType;
 
 /// Preferred alignment for fixed-width **values** buffers (format §1.3).
 pub const VALUES_BUFFER_ALIGN: usize = 64;
 
 /// Minimum alignment for header, schema tail, and directory placement (format §1.3 / §2.1).
 pub const SECTION_ALIGN: usize = 8;
-
-/// Opaque v0 discriminator for an 8-byte fixed-width signed integer column (Arrow Int64-sized).
-pub const V0_PHYSICAL_FIXED_WIDTH_I64: u32 = 1;
-/// Opaque v0 discriminator for a UTF-8 column with 4-byte offsets (Arrow Utf8).
-pub const V0_PHYSICAL_UTF8_I32: u32 = 2;
-/// Opaque v0 discriminator for a UTF-8 column with 8-byte offsets (Arrow LargeUtf8).
-pub const V0_PHYSICAL_UTF8_I64: u32 = 3;
 
 /// Values-buffer alignment strategy recorded in the file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -104,6 +98,7 @@ pub enum ColumnarWriteError {
         offset: u64,
         required_alignment: usize,
     },
+    UnsupportedColumnType(ColumnarType),
 }
 
 impl core::fmt::Display for ColumnarWriteError {
@@ -168,6 +163,9 @@ impl core::fmt::Display for ColumnarWriteError {
                 f,
                 "column {column_index} data offset {offset} is not aligned to {required_alignment}"
             ),
+            ColumnarWriteError::UnsupportedColumnType(t) => {
+                write!(f, "unsupported column type for write: {t:?}")
+            }
         }
     }
 }
@@ -355,7 +353,6 @@ impl ColumnarWriter {
     pub fn write_int64_column_chunk(
         &mut self,
         column_id: u32,
-        logical_type: u32,
         values: &[u8],
         validity: Option<&[u8]>,
         stats: Option<Int64Stats>,
@@ -380,8 +377,7 @@ impl ColumnarWriter {
 
         Ok(ColumnMeta {
             column_id,
-            physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-            logical_type,
+            column_type: ColumnarType::Int64,
             data_offset,
             data_length,
             validity_offset,
@@ -393,44 +389,23 @@ impl ColumnarWriter {
         })
     }
 
-    /// Writes a single `Utf8` column chunk with 4-byte offsets, plus optional validity and stats.
-    pub fn write_utf8_i32_column_chunk(
+    pub fn write_variable_column_chunk(
         &mut self,
         column_id: u32,
-        logical_type: u32,
+        column_type: ColumnarType,
         offsets: &[u8],
         values: &[u8],
         validity: Option<&[u8]>,
         stats: Option<&[u8]>,
     ) -> Result<ColumnMeta, ColumnarWriteError> {
+        let offset_width = column_type
+            .offset_width()
+            .ok_or(ColumnarWriteError::UnsupportedColumnType(column_type))?;
         self.write_utf8_column_chunk(
             column_id,
-            logical_type,
-            V0_PHYSICAL_UTF8_I32,
+            column_type,
             offsets,
-            std::mem::size_of::<i32>(),
-            values,
-            validity,
-            stats,
-        )
-    }
-
-    /// Writes a single `LargeUtf8` column chunk with 8-byte offsets, plus optional validity and stats.
-    pub fn write_utf8_i64_column_chunk(
-        &mut self,
-        column_id: u32,
-        logical_type: u32,
-        offsets: &[u8],
-        values: &[u8],
-        validity: Option<&[u8]>,
-        stats: Option<&[u8]>,
-    ) -> Result<ColumnMeta, ColumnarWriteError> {
-        self.write_utf8_column_chunk(
-            column_id,
-            logical_type,
-            V0_PHYSICAL_UTF8_I64,
-            offsets,
-            std::mem::size_of::<i64>(),
+            offset_width,
             values,
             validity,
             stats,
@@ -554,8 +529,7 @@ impl ColumnarWriter {
     fn write_utf8_column_chunk(
         &mut self,
         column_id: u32,
-        logical_type: u32,
-        physical_type: u32,
+        column_type: ColumnarType,
         offsets: &[u8],
         offset_width: usize,
         values: &[u8],
@@ -574,8 +548,7 @@ impl ColumnarWriter {
 
         Ok(ColumnMeta {
             column_id,
-            physical_type,
-            logical_type,
+            column_type,
             data_offset,
             data_length,
             validity_offset,
@@ -817,7 +790,6 @@ mod tests {
         let meta = writer
             .write_int64_column_chunk(
                 0,
-                0,
                 &values,
                 Some(&validity),
                 Some(Int64Stats {
@@ -863,7 +835,7 @@ mod tests {
         let validity = encode_validity(&[true, false, true]);
 
         let meta = writer
-            .write_utf8_i32_column_chunk(0, 0, &offsets, values, Some(&validity), None)
+            .write_variable_column_chunk(0, ColumnarType::Utf8, &offsets, values, Some(&validity), None)
             .unwrap();
 
         writer
@@ -887,9 +859,8 @@ mod tests {
 
         let offsets = encode_i32(&[0, 99]);
         let err = writer
-            .write_utf8_i32_column_chunk(0, 0, &offsets, b"abc", None, None)
+            .write_variable_column_chunk(0, ColumnarType::Utf8, &offsets, b"abc", None, None)
             .unwrap_err();
         assert!(matches!(err, ColumnarWriteError::OffsetOutOfBounds { .. }));
     }
 }
-''

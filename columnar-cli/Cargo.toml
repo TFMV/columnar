@@ -10,3 +10,7 @@ default-run = "columnar-cli"
 [[bin]]
 name = "columnar-cli"
 path = "src/main.rs"
+
+[dependencies]
+columnar-format = { path = "../columnar-format" }
+columnar-mmap = { path = "../columnar-mmap" }

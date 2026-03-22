@@ -1,5 +1,6 @@
 //! Column directory: contiguous [`ColumnMeta`] records (format §5–6).
 
+use crate::types::{ColumnarType, InvalidColumnarType};
 use core::fmt;
 
 /// Minimum buffer start alignment (format §1 / §6).
@@ -13,8 +14,7 @@ pub const COLUMN_META_LEN: usize = 80;
 #[repr(C)]
 pub struct ColumnMeta {
     pub column_id: u32,
-    pub physical_type: u32,
-    pub logical_type: u32,
+    pub column_type: ColumnarType,
     pub data_offset: u64,
     pub data_length: u64,
     pub validity_offset: u64,
@@ -25,29 +25,6 @@ pub struct ColumnMeta {
     pub stats_length: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<ColumnMeta>() == COLUMN_META_LEN);
-const _: () = assert!(core::mem::align_of::<ColumnMeta>() == 8);
-
-/// Identifies which buffer range failed validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferField {
-    Data,
-    Validity,
-    Offsets,
-    Stats,
-}
-
-impl fmt::Display for BufferField {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            BufferField::Data => "data",
-            BufferField::Validity => "validity",
-            BufferField::Offsets => "offsets",
-            BufferField::Stats => "stats",
-        })
-    }
-}
-
 /// Errors from parsing or validating directory / column metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnDirectoryError {
@@ -55,9 +32,9 @@ pub enum ColumnDirectoryError {
     TruncatedEntry { need: usize, got: usize },
     /// Directory byte length is not a multiple of [`COLUMN_META_LEN`].
     WrongDirectoryLength { got: usize, multiple_of: usize },
-    /// Bytes `[12..16]` in a wire record must be zero.
-    NonZeroMetaPadding { got: u32 },
-    /// Buffer start not aligned to [`MIN_BUFFER_ALIGN`] while length &gt; 0.
+    /// Bytes `[8..16]` in a wire record must be zero.
+    NonZeroMetaPadding { got: u64 },
+    /// Buffer start not aligned to [`MIN_BUFFER_ALIGN`] while length > 0.
     UnalignedBufferStart {
         column_index: usize,
         field: BufferField,
@@ -94,6 +71,14 @@ pub enum ColumnDirectoryError {
     WrongSerializeBufferLen { need: usize, got: usize },
     /// Column index out of range for [`ColumnDirectoryView::get`].
     InvalidColumnIndex { index: usize, len: usize },
+    /// Invalid columnar type code.
+    InvalidColumnarType(InvalidColumnarType),
+}
+
+impl From<InvalidColumnarType> for ColumnDirectoryError {
+    fn from(value: InvalidColumnarType) -> Self {
+        Self::InvalidColumnarType(value)
+    }
 }
 
 impl fmt::Display for ColumnDirectoryError {
@@ -156,10 +141,10 @@ impl fmt::Display for ColumnDirectoryError {
             ColumnDirectoryError::InvalidColumnIndex { index, len } => {
                 write!(f, "column index {index} out of range (column count {len})")
             }
+            ColumnDirectoryError::InvalidColumnarType(err) => write!(f, "{err}"),
         }
     }
 }
-
 impl std::error::Error for ColumnDirectoryError {}
 
 impl ColumnMeta {
@@ -172,9 +157,8 @@ impl ColumnMeta {
             });
         }
         out[0..4].copy_from_slice(&self.column_id.to_le_bytes());
-        out[4..8].copy_from_slice(&self.physical_type.to_le_bytes());
-        out[8..12].copy_from_slice(&self.logical_type.to_le_bytes());
-        out[12..16].fill(0);
+        out[4..8].copy_from_slice(&(self.column_type as u32).to_le_bytes());
+        out[8..16].fill(0);
         out[16..24].copy_from_slice(&self.data_offset.to_le_bytes());
         out[24..32].copy_from_slice(&self.data_length.to_le_bytes());
         out[32..40].copy_from_slice(&self.validity_offset.to_le_bytes());
@@ -201,14 +185,15 @@ impl ColumnMeta {
                 got: bytes.len(),
             });
         }
-        let pad = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let pad = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         if pad != 0 {
             return Err(ColumnDirectoryError::NonZeroMetaPadding { got: pad });
         }
+        let physical_type_code = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+
         Ok(ColumnMeta {
             column_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            physical_type: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            logical_type: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            column_type: ColumnarType::try_from(physical_type_code)?,
             data_offset: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
             data_length: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
             validity_offset: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
@@ -217,6 +202,26 @@ impl ColumnMeta {
             offsets_length: u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
             stats_offset: u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
             stats_length: u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+        })
+    }
+}
+
+/// Identifies which buffer range failed validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferField {
+    Data,
+    Validity,
+    Offsets,
+    Stats,
+}
+
+impl fmt::Display for BufferField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            BufferField::Data => "data",
+            BufferField::Validity => "validity",
+            BufferField::Offsets => "offsets",
+            BufferField::Stats => "stats",
         })
     }
 }
@@ -509,9 +514,11 @@ mod tests {
         BufferField, ColumnDirectory, ColumnDirectoryError, ColumnDirectoryView, ColumnMeta,
         COLUMN_META_LEN,
     };
+    use crate::types::ColumnarType;
 
     fn meta(
         id: u32,
+        column_type: ColumnarType,
         data_off: u64,
         data_len: u64,
         val_off: u64,
@@ -523,8 +530,7 @@ mod tests {
     ) -> ColumnMeta {
         ColumnMeta {
             column_id: id,
-            physical_type: id,
-            logical_type: 0,
+            column_type,
             data_offset: data_off,
             data_length: data_len,
             validity_offset: val_off,
@@ -538,7 +544,7 @@ mod tests {
 
     #[test]
     fn column_meta_round_trip_wire_matches_repr_size() {
-        let m = meta(1, 100, 10, 0, 0, 0, 0, 0, 0);
+        let m = meta(1, ColumnarType::Int64, 100, 10, 0, 0, 0, 0, 0, 0);
         let b = m.serialize();
         assert_eq!(b.len(), COLUMN_META_LEN);
         assert_eq!(ColumnMeta::deserialize(&b).unwrap(), m);
@@ -547,9 +553,9 @@ mod tests {
     #[test]
     fn directory_round_trip_three_columns() {
         let dir = ColumnDirectory::new(vec![
-            meta(0, 64, 16, 0, 0, 0, 0, 0, 0),
-            meta(1, 80, 8, 0, 0, 0, 0, 0, 0),
-            meta(2, 88, 24, 0, 0, 0, 0, 0, 0),
+            meta(0, ColumnarType::Int64, 64, 16, 0, 0, 0, 0, 0, 0),
+            meta(1, ColumnarType::Int64, 80, 8, 0, 0, 0, 0, 0, 0),
+            meta(2, ColumnarType::Int64, 88, 24, 0, 0, 0, 0, 0, 0),
         ]);
         let bytes = dir.serialize();
         assert_eq!(bytes.len(), 3 * COLUMN_META_LEN);
@@ -564,8 +570,8 @@ mod tests {
     #[test]
     fn mmap_view_get_matches_deserialize() {
         let dir = ColumnDirectory::new(vec![
-            meta(10, 128, 32, 0, 0, 0, 0, 0, 0),
-            meta(11, 160, 32, 0, 0, 0, 0, 0, 0),
+            meta(10, ColumnarType::Int64, 128, 32, 0, 0, 0, 0, 0, 0),
+            meta(11, ColumnarType::Int64, 160, 32, 0, 0, 0, 0, 0, 0),
         ]);
         let bytes = dir.serialize();
         let view = ColumnDirectoryView::new(&bytes).unwrap();
@@ -589,8 +595,8 @@ mod tests {
     #[test]
     fn overlapping_buffers_rejected() {
         let dir = ColumnDirectory::new(vec![
-            meta(0, 64, 32, 0, 0, 0, 0, 0, 0),
-            meta(1, 80, 32, 0, 0, 0, 0, 0, 0),
+            meta(0, ColumnarType::Int64, 64, 32, 0, 0, 0, 0, 0, 0),
+            meta(1, ColumnarType::Int64, 80, 32, 0, 0, 0, 0, 0, 0),
         ]);
         let err = dir.validate(10_000).unwrap_err();
         match err {
@@ -601,7 +607,7 @@ mod tests {
 
     #[test]
     fn unaligned_data_offset_rejected() {
-        let dir = ColumnDirectory::new(vec![meta(0, 65, 8, 0, 0, 0, 0, 0, 0)]);
+        let dir = ColumnDirectory::new(vec![meta(0, ColumnarType::Int64, 65, 8, 0, 0, 0, 0, 0, 0)]);
         let err = dir.validate(200).unwrap_err();
         assert_eq!(
             err,
@@ -615,7 +621,7 @@ mod tests {
 
     #[test]
     fn out_of_bounds_rejected() {
-        let dir = ColumnDirectory::new(vec![meta(0, 64, 100, 0, 0, 0, 0, 0, 0)]);
+        let dir = ColumnDirectory::new(vec![meta(0, ColumnarType::Int64, 64, 100, 0, 0, 0, 0, 0, 0)]);
         let err = dir.validate(120).unwrap_err();
         match err {
             ColumnDirectoryError::BufferOutOfBounds { .. } => {}
@@ -626,24 +632,24 @@ mod tests {
     #[test]
     fn multi_column_non_overlapping_valid() {
         let dir = ColumnDirectory::new(vec![
-            meta(0, 64, 32, 96, 8, 104, 16, 120, 8),
-            meta(1, 128, 64, 192, 8, 200, 8, 208, 16),
-            meta(2, 224, 32, 0, 0, 0, 0, 256, 8),
+            meta(0, ColumnarType::Int64, 64, 32, 96, 8, 104, 16, 120, 8),
+            meta(1, ColumnarType::Utf8, 128, 64, 192, 8, 200, 8, 208, 16),
+            meta(2, ColumnarType::Int64, 224, 32, 0, 0, 0, 0, 256, 8),
         ]);
         dir.validate(300).unwrap();
     }
 
     #[test]
     fn non_zero_meta_padding_rejected() {
-        let mut b = meta(0, 0, 0, 0, 0, 0, 0, 0, 0).serialize();
-        b[12..16].copy_from_slice(&1u32.to_le_bytes());
+        let mut b = meta(0, ColumnarType::Int64, 0, 0, 0, 0, 0, 0, 0, 0).serialize();
+        b[8..16].copy_from_slice(&1u64.to_le_bytes());
         let err = ColumnMeta::deserialize(&b).unwrap_err();
         assert_eq!(err, ColumnDirectoryError::NonZeroMetaPadding { got: 1 });
     }
 
     #[test]
     fn view_index_out_of_range() {
-        let dir = ColumnDirectory::new(vec![meta(0, 64, 8, 0, 0, 0, 0, 0, 0)]);
+        let dir = ColumnDirectory::new(vec![meta(0, ColumnarType::Int64, 64, 8, 0, 0, 0, 0, 0, 0)]);
         let bytes = dir.serialize();
         let view = ColumnDirectoryView::new(&bytes).unwrap();
         let err = view.get(1).unwrap_err();
@@ -656,8 +662,8 @@ mod tests {
     #[test]
     fn overlap_report_includes_columns() {
         let dir = ColumnDirectory::new(vec![
-            meta(0, 64, 32, 0, 0, 0, 0, 0, 0),
-            meta(1, 80, 8, 0, 0, 0, 0, 0, 0),
+            meta(0, ColumnarType::Int64, 64, 32, 0, 0, 0, 0, 0, 0),
+            meta(1, ColumnarType::Int64, 80, 8, 0, 0, 0, 0, 0, 0),
         ]);
         let err = dir.validate(500).unwrap_err();
         let ColumnDirectoryError::OverlappingBuffers {
