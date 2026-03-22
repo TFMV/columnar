@@ -683,6 +683,11 @@ dependencies = [
 [[package]]
 name = "columnar-format"
 version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "columnar-arrow",
+ "columnar-mmap",
+]
 
 [[package]]
 name = "columnar-mmap"
