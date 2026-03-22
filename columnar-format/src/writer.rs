@@ -1,4 +1,4 @@
-//! Build a v0 `.columnar` file: header, schema, column directory, then fixed-width column values.
+//! Build a v0 `.columnar` file: header, schema, column directory, then column buffers.
 //!
 //! On-disk section order matches format §2.1: **header → schema → directory → chunks**. The writer
 //! reserves the directory after the schema, aligns for the values buffer (64-byte preferred per
@@ -7,7 +7,8 @@
 use crate::align::align_offset;
 use crate::directory::{ColumnMeta, COLUMN_META_LEN};
 use crate::header::{
-    FileHeader, FILE_HEADER_LEN, FILE_HEADER_MAGIC, FILE_HEADER_ON_DISK_SIZE, FILE_HEADER_VERSION,
+    FileHeader, FILE_FLAG_VALUES_ALIGNED_64, FILE_HEADER_LEN, FILE_HEADER_MAGIC,
+    FILE_HEADER_ON_DISK_SIZE, FILE_HEADER_VERSION,
 };
 
 /// Preferred alignment for fixed-width **values** buffers (format §1.3).
@@ -18,6 +19,36 @@ pub const SECTION_ALIGN: usize = 8;
 
 /// Opaque v0 discriminator for an 8-byte fixed-width signed integer column (Arrow Int64-sized).
 pub const V0_PHYSICAL_FIXED_WIDTH_I64: u32 = 1;
+/// Opaque v0 discriminator for a UTF-8 column with 4-byte offsets (Arrow Utf8).
+pub const V0_PHYSICAL_UTF8_I32: u32 = 2;
+/// Opaque v0 discriminator for a UTF-8 column with 8-byte offsets (Arrow LargeUtf8).
+pub const V0_PHYSICAL_UTF8_I64: u32 = 3;
+
+/// Values-buffer alignment strategy recorded in the file header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ValueAlignmentStrategy {
+    #[default]
+    Minimum8,
+    Align64,
+}
+
+impl ValueAlignmentStrategy {
+    #[inline]
+    pub const fn alignment(self) -> usize {
+        match self {
+            Self::Minimum8 => SECTION_ALIGN,
+            Self::Align64 => VALUES_BUFFER_ALIGN,
+        }
+    }
+
+    #[inline]
+    const fn header_flags(self) -> u16 {
+        match self {
+            Self::Minimum8 => 0,
+            Self::Align64 => FILE_FLAG_VALUES_ALIGNED_64,
+        }
+    }
+}
 
 /// Errors while building a Columnar file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +65,12 @@ pub enum ColumnarWriteError {
     ZeroElementWidth,
     /// `usize` overflow sizing the directory.
     SizeOverflow,
+    /// `data_offset` in a directory entry does not satisfy the configured values alignment.
+    MisalignedDataOffset {
+        column_index: usize,
+        offset: u64,
+        required_alignment: usize,
+    },
 }
 
 impl core::fmt::Display for ColumnarWriteError {
@@ -52,6 +89,14 @@ impl core::fmt::Display for ColumnarWriteError {
             ),
             ColumnarWriteError::ZeroElementWidth => write!(f, "element width must be non-zero"),
             ColumnarWriteError::SizeOverflow => write!(f, "size calculation overflow"),
+            ColumnarWriteError::MisalignedDataOffset {
+                column_index,
+                offset,
+                required_alignment,
+            } => write!(
+                f,
+                "column {column_index} data offset {offset} is not aligned to {required_alignment}"
+            ),
         }
     }
 }
@@ -65,6 +110,9 @@ pub struct ColumnarWriter {
     schema_raw_len: u64,
     dir_start: usize,
     dir_columns: usize,
+    logical_column_count: usize,
+    chunk_count: usize,
+    values_alignment: ValueAlignmentStrategy,
     header_written: bool,
     schema_written: bool,
     dir_reserved: bool,
@@ -80,6 +128,9 @@ impl ColumnarWriter {
             schema_raw_len: 0,
             dir_start: 0,
             dir_columns: 0,
+            logical_column_count: 0,
+            chunk_count: 0,
+            values_alignment: ValueAlignmentStrategy::Minimum8,
             header_written: false,
             schema_written: false,
             dir_reserved: false,
@@ -87,6 +138,17 @@ impl ColumnarWriter {
             dir_patched: false,
             finalized: false,
         }
+    }
+
+    #[inline]
+    pub fn with_value_alignment(mut self, values_alignment: ValueAlignmentStrategy) -> Self {
+        self.values_alignment = values_alignment;
+        self
+    }
+
+    #[inline]
+    pub fn value_alignment_strategy(&self) -> ValueAlignmentStrategy {
+        self.values_alignment
     }
 
     /// Writes a 64-byte **placeholder** header (zeros). Must be called on an empty writer.
@@ -161,6 +223,8 @@ impl ColumnarWriter {
         self.buf.resize(dir_start + add, 0);
         self.dir_start = dir_start;
         self.dir_columns = columns;
+        self.logical_column_count = 0;
+        self.chunk_count = 0;
         self.dir_reserved = true;
         self.values_written = false;
         self.dir_patched = false;
@@ -206,6 +270,16 @@ impl ColumnarWriter {
         Ok((offset, length))
     }
 
+    /// Aligns and appends a column values buffer according to the configured strategy.
+    pub fn write_values_buffer(
+        &mut self,
+        values: &[u8],
+        element_width: usize,
+    ) -> Result<(u64, u64), ColumnarWriteError> {
+        self.pad_to_alignment(self.values_alignment.alignment())?;
+        self.write_fixed_width_values(values, element_width)
+    }
+
     /// Overwrites the reserved directory region with serialized [`ColumnMeta`] entries.
     pub fn patch_column_directory(
         &mut self,
@@ -235,13 +309,25 @@ impl ColumnarWriter {
                 "directory patch past end of buffer",
             ));
         }
+        let required_alignment = self.values_alignment.alignment();
+        let (logical_column_count, chunk_count) =
+            infer_chunk_layout(entries).map_err(ColumnarWriteError::State)?;
         for (index, entry) in entries.iter().enumerate() {
+            if entry.data_length > 0 && entry.data_offset % required_alignment as u64 != 0 {
+                return Err(ColumnarWriteError::MisalignedDataOffset {
+                    column_index: index,
+                    offset: entry.data_offset,
+                    required_alignment,
+                });
+            }
             let start = self.dir_start + index * COLUMN_META_LEN;
             let entry_end = start + COLUMN_META_LEN;
             entry
                 .serialize_into(&mut self.buf[start..entry_end])
                 .map_err(|_| ColumnarWriteError::State("directory serialize_into failed"))?;
         }
+        self.logical_column_count = logical_column_count;
+        self.chunk_count = chunk_count;
         self.dir_patched = true;
         Ok(())
     }
@@ -271,14 +357,15 @@ impl ColumnarWriter {
         let header = FileHeader {
             magic: FILE_HEADER_MAGIC,
             version: FILE_HEADER_VERSION,
-            flags: 0,
+            flags: self.values_alignment.header_flags(),
             header_size: FILE_HEADER_ON_DISK_SIZE,
             schema_offset: FILE_HEADER_LEN as u64,
             schema_length: self.schema_raw_len,
             column_dir_offset: self.dir_start as u64,
             column_dir_length,
             reserved: [0u8; 8],
-        };
+        }
+        .with_chunk_layout(self.logical_column_count as u32, self.chunk_count as u32);
         header
             .validate()
             .map_err(|_| ColumnarWriteError::State("constructed header failed validate"))?;
@@ -306,4 +393,26 @@ impl ColumnarWriter {
     pub fn directory_column_count(&self) -> usize {
         self.dir_columns
     }
+}
+
+fn infer_chunk_layout(entries: &[ColumnMeta]) -> Result<(usize, usize), &'static str> {
+    if entries.is_empty() {
+        return Err("directory must contain at least one entry");
+    }
+
+    let mut max_column_id = 0u32;
+    for entry in entries {
+        max_column_id = max_column_id.max(entry.column_id);
+    }
+    let logical_column_count = max_column_id as usize + 1;
+    if entries.len() % logical_column_count != 0 {
+        return Err("directory entries do not form whole chunks");
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let expected_column_id = (index % logical_column_count) as u32;
+        if entry.column_id != expected_column_id {
+            return Err("directory entries are not laid out chunk-major");
+        }
+    }
+    Ok((logical_column_count, entries.len() / logical_column_count))
 }

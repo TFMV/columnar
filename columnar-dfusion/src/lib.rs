@@ -2,10 +2,11 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use columnar_arrow::{build_int64_array_from_mmap, ArrowBuildError};
 use columnar_format::{ColumnarReadError, ColumnarReader, V0_PHYSICAL_FIXED_WIDTH_I64};
@@ -13,9 +14,16 @@ use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, ScalarValue};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{Expr, Operator, TableType};
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion_datasource::memory::MemorySourceConfig;
+use datafusion_common::stats::Precision;
+use datafusion_common::Statistics;
+use datafusion_datasource::source::{DataSource, DataSourceExec};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::TableProviderFilterPushDown;
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::{DisplayFormatType, ExecutionPlan};
+use futures::stream;
 use memmap2::Mmap;
 
 /// Fixed-width `i64` stats stored as little-endian `(min, max)`.
@@ -173,6 +181,17 @@ pub struct ColumnarTableProvider {
     metrics: Arc<ReadMetrics>,
 }
 
+#[derive(Debug, Clone)]
+struct ColumnarDataSource {
+    mmap: Arc<Mmap>,
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    included_chunks: Vec<usize>,
+    chunk_row_counts: Vec<usize>,
+    metrics: Arc<ReadMetrics>,
+    fetch: Option<usize>,
+}
+
 impl ColumnarTableProvider {
     /// Build a provider from a live mmap and a matching Arrow schema.
     ///
@@ -186,16 +205,18 @@ impl ColumnarTableProvider {
             });
         }
 
-        for index in 0..reader.column_count() {
-            let meta = reader.column_meta(index)?;
-            if meta.physical_type != V0_PHYSICAL_FIXED_WIDTH_I64 {
-                return Err(ColumnarTableProviderError::UnsupportedPhysicalType {
-                    column_index: index,
-                    physical_type: meta.physical_type,
-                });
-            }
-            if let Some(stats) = reader.column_stats(index)? {
-                let _ = Int64ChunkStats::try_from_slice(index, stats)?;
+        for chunk_index in 0..reader.chunk_count() {
+            for index in 0..reader.column_count() {
+                let meta = reader.chunk_column_meta(chunk_index, index)?;
+                if meta.physical_type != V0_PHYSICAL_FIXED_WIDTH_I64 {
+                    return Err(ColumnarTableProviderError::UnsupportedPhysicalType {
+                        column_index: index,
+                        physical_type: meta.physical_type,
+                    });
+                }
+                if let Some(stats) = reader.chunk_column_stats(chunk_index, index)? {
+                    let _ = Int64ChunkStats::try_from_slice(index, stats)?;
+                }
             }
         }
 
@@ -211,21 +232,61 @@ impl ColumnarTableProvider {
         self.metrics.clone()
     }
 
+    fn chunk_pruned(
+        &self,
+        reader: &ColumnarReader<'_>,
+        chunk_index: usize,
+        filters: &[Expr],
+    ) -> Result<bool, ColumnarTableProviderError> {
+        let mut stats_cache = HashMap::new();
+
+        for filter in filters {
+            if expr_proves_chunk_empty(
+                filter,
+                self.schema.as_ref(),
+                &reader,
+                chunk_index,
+                &self.metrics,
+                &mut stats_cache,
+            )? {
+                self.metrics.chunks_pruned.fetch_add(1, Ordering::Relaxed);
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+impl ColumnarDataSource {
+    fn projected_indices(&self) -> Vec<usize> {
+        projection_indices(self.schema.as_ref(), self.projection.as_ref())
+    }
+
+    fn projected_schema(&self) -> SchemaRef {
+        projected_schema(self.schema.clone(), &self.projected_indices())
+    }
+
+    fn exact_row_count(&self) -> usize {
+        let total = self.chunk_row_counts.iter().copied().sum::<usize>();
+        self.fetch.map_or(total, |limit| limit.min(total))
+    }
+
     fn build_projected_batch(
         &self,
-        projection: Option<&Vec<usize>>,
+        reader: &ColumnarReader<'_>,
+        chunk_index: usize,
     ) -> Result<RecordBatch, ColumnarTableProviderError> {
-        let reader = ColumnarReader::new(self.mmap.as_ref())?;
-        let projected_indices = projection_indices(self.schema.as_ref(), projection);
-        let projected_schema = projected_schema(self.schema.clone(), &projected_indices);
+        let projected_indices = self.projected_indices();
+        let projected_schema = self.projected_schema();
 
         let mut columns = Vec::with_capacity(projected_indices.len());
         for &index in &projected_indices {
             self.metrics
                 .data_buffers_read
                 .fetch_add(1, Ordering::Relaxed);
-            let values = reader.column_values(index)?;
-            let validity = reader.column_validity(index)?;
+            let values = reader.chunk_column_values(chunk_index, index)?;
+            let validity = reader.chunk_column_validity(chunk_index, index)?;
             let array = build_int64_array_from_mmap(self.mmap.clone(), values, validity)?;
             columns.push(Arc::new(array) as ArrayRef);
         }
@@ -236,38 +297,95 @@ impl ColumnarTableProvider {
 
         RecordBatch::try_new(projected_schema, columns).map_err(Into::into)
     }
+}
 
-    fn build_empty_batch(
+impl DataSource for ColumnarDataSource {
+    fn open(
         &self,
-        projection: Option<&Vec<usize>>,
-    ) -> Result<RecordBatch, ColumnarTableProviderError> {
-        let projected_indices = projection_indices(self.schema.as_ref(), projection);
-        let projected_schema = projected_schema(self.schema.clone(), &projected_indices);
-        let mut columns = Vec::with_capacity(projected_indices.len());
-        for _ in &projected_indices {
-            columns.push(Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef);
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "invalid partition {partition} for ColumnarDataSource"
+            )));
         }
-        RecordBatch::try_new(projected_schema, columns).map_err(Into::into)
+
+        let projected_schema = self.projected_schema();
+        let stream_source = self.clone();
+        let stream = stream::try_unfold(
+            (stream_source, 0usize, self.fetch.unwrap_or(usize::MAX)),
+            |(source, next_chunk, remaining)| async move {
+                if next_chunk >= source.included_chunks.len() || remaining == 0 {
+                    return Ok(None);
+                }
+                let chunk_index = source.included_chunks[next_chunk];
+                let reader = ColumnarReader::new(source.mmap.as_ref())
+                    .map_err(ColumnarTableProviderError::from)
+                    .map_err(DataFusionError::from)?;
+                let batch = source
+                    .build_projected_batch(&reader, chunk_index)
+                    .map_err(DataFusionError::from)?;
+                let next_state = (
+                    source,
+                    next_chunk + 1,
+                    remaining.saturating_sub(batch.num_rows()),
+                );
+                Ok(Some((batch, next_state)))
+            },
+        );
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            projected_schema,
+            stream,
+        )))
     }
 
-    fn chunk_pruned(&self, filters: &[Expr]) -> Result<bool, ColumnarTableProviderError> {
-        let reader = ColumnarReader::new(self.mmap.as_ref())?;
-        let mut stats_cache = HashMap::new();
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 
-        for filter in filters {
-            if expr_proves_chunk_empty(
-                filter,
-                self.schema.as_ref(),
-                &reader,
-                &self.metrics,
-                &mut stats_cache,
-            )? {
-                self.metrics.chunks_pruned.fetch_add(1, Ordering::Relaxed);
-                return Ok(true);
-            }
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
+                f,
+                "chunks={}, projection={:?}, fetch={:?}",
+                self.included_chunks.len(),
+                self.projection,
+                self.fetch
+            ),
         }
+    }
 
-        Ok(false)
+    fn output_partitioning(&self) -> Partitioning {
+        Partitioning::UnknownPartitioning(1)
+    }
+
+    fn eq_properties(&self) -> EquivalenceProperties {
+        EquivalenceProperties::new(self.projected_schema())
+    }
+
+    fn statistics(&self) -> DataFusionResult<Statistics> {
+        Ok(Statistics {
+            num_rows: Precision::Exact(self.exact_row_count()),
+            ..Statistics::new_unknown(&self.projected_schema())
+        })
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        let mut source = self.clone();
+        source.fetch = limit;
+        Some(Arc::new(source))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &ProjectionExec,
+    ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
     }
 }
 
@@ -308,16 +426,32 @@ impl TableProvider for ColumnarTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let batch = if self.chunk_pruned(filters)? {
-            self.build_empty_batch(projection)?
-        } else {
-            self.build_projected_batch(projection)?
-        };
+        let reader =
+            ColumnarReader::new(self.mmap.as_ref()).map_err(ColumnarTableProviderError::from)?;
+        let mut included_chunks = Vec::with_capacity(reader.chunk_count());
+        let mut chunk_row_counts = Vec::with_capacity(reader.chunk_count());
+        for chunk_index in 0..reader.chunk_count() {
+            if self.chunk_pruned(&reader, chunk_index, filters)? {
+                continue;
+            }
+            included_chunks.push(chunk_index);
+            chunk_row_counts.push(
+                reader
+                    .chunk_row_count(chunk_index)
+                    .map_err(ColumnarTableProviderError::from)?,
+            );
+        }
 
-        let schema = batch.schema();
-        let plan: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?;
-        Ok(plan.with_fetch(limit).unwrap_or(plan))
+        let source = ColumnarDataSource {
+            mmap: self.mmap.clone(),
+            schema: self.schema.clone(),
+            projection: projection.cloned(),
+            included_chunks,
+            chunk_row_counts,
+            metrics: self.metrics.clone(),
+            fetch: limit,
+        };
+        Ok(Arc::new(DataSourceExec::new(Arc::new(source))))
     }
 }
 
@@ -360,35 +494,42 @@ fn expr_proves_chunk_empty(
     expr: &Expr,
     schema: &arrow_schema::Schema,
     reader: &ColumnarReader<'_>,
+    chunk_index: usize,
     metrics: &ReadMetrics,
-    stats_cache: &mut HashMap<usize, Option<Int64ChunkStats>>,
+    stats_cache: &mut HashMap<(usize, usize), Option<Int64ChunkStats>>,
 ) -> Result<bool, ColumnarTableProviderError> {
     match expr {
         Expr::BinaryExpr(binary) => match binary.op {
-            Operator::And => {
-                Ok(
-                    expr_proves_chunk_empty(&binary.left, schema, reader, metrics, stats_cache)?
-                        || expr_proves_chunk_empty(
-                            &binary.right,
-                            schema,
-                            reader,
-                            metrics,
-                            stats_cache,
-                        )?,
-                )
-            }
-            Operator::Or => {
-                Ok(
-                    expr_proves_chunk_empty(&binary.left, schema, reader, metrics, stats_cache)?
-                        && expr_proves_chunk_empty(
-                            &binary.right,
-                            schema,
-                            reader,
-                            metrics,
-                            stats_cache,
-                        )?,
-                )
-            }
+            Operator::And => Ok(expr_proves_chunk_empty(
+                &binary.left,
+                schema,
+                reader,
+                chunk_index,
+                metrics,
+                stats_cache,
+            )? || expr_proves_chunk_empty(
+                &binary.right,
+                schema,
+                reader,
+                chunk_index,
+                metrics,
+                stats_cache,
+            )?),
+            Operator::Or => Ok(expr_proves_chunk_empty(
+                &binary.left,
+                schema,
+                reader,
+                chunk_index,
+                metrics,
+                stats_cache,
+            )? && expr_proves_chunk_empty(
+                &binary.right,
+                schema,
+                reader,
+                chunk_index,
+                metrics,
+                stats_cache,
+            )?),
             Operator::Eq
             | Operator::NotEq
             | Operator::Lt
@@ -401,7 +542,9 @@ fn expr_proves_chunk_empty(
                 let Some(column_index) = schema.index_of(column_name).ok() else {
                     return Ok(false);
                 };
-                let Some(stats) = load_stats(column_index, reader, metrics, stats_cache)? else {
+                let Some(stats) =
+                    load_stats(chunk_index, column_index, reader, metrics, stats_cache)?
+                else {
                     return Ok(false);
                 };
                 Ok(!stats.may_satisfy(op, literal))
@@ -413,23 +556,25 @@ fn expr_proves_chunk_empty(
 }
 
 fn load_stats(
+    chunk_index: usize,
     column_index: usize,
     reader: &ColumnarReader<'_>,
     metrics: &ReadMetrics,
-    stats_cache: &mut HashMap<usize, Option<Int64ChunkStats>>,
+    stats_cache: &mut HashMap<(usize, usize), Option<Int64ChunkStats>>,
 ) -> Result<Option<Int64ChunkStats>, ColumnarTableProviderError> {
-    if let Some(stats) = stats_cache.get(&column_index) {
+    let cache_key = (chunk_index, column_index);
+    if let Some(stats) = stats_cache.get(&cache_key) {
         return Ok(*stats);
     }
 
     let stats = reader
-        .column_stats(column_index)?
+        .chunk_column_stats(chunk_index, column_index)?
         .map(|bytes| Int64ChunkStats::try_from_slice(column_index, bytes))
         .transpose()?;
     if stats.is_some() {
         metrics.stats_buffers_read.fetch_add(1, Ordering::Relaxed);
     }
-    stats_cache.insert(column_index, stats);
+    stats_cache.insert(cache_key, stats);
     Ok(stats)
 }
 
@@ -499,6 +644,17 @@ mod tests {
     }
 
     fn write_test_file(columns: &[&[i64]]) -> NamedTempFile {
+        write_chunked_test_file(&[columns])
+    }
+
+    fn write_chunked_test_file(chunks: &[&[&[i64]]]) -> NamedTempFile {
+        assert!(!chunks.is_empty());
+        let column_count = chunks[0].len();
+        assert!(column_count > 0);
+        for chunk in chunks {
+            assert_eq!(chunk.len(), column_count);
+        }
+
         let mut writer = ColumnarWriter::new();
         writer
             .write_header_placeholder()
@@ -507,40 +663,42 @@ mod tests {
             .write_schema_block(b"schema-not-parsed-here")
             .expect("schema");
         writer
-            .reserve_column_directory(columns.len())
+            .reserve_column_directory(chunks.len() * column_count)
             .expect("reserve directory");
 
-        let mut metas = Vec::with_capacity(columns.len());
-        for (index, values) in columns.iter().enumerate() {
-            writer
-                .pad_to_alignment(MIN_BUFFER_ALIGN as usize)
-                .expect("align stats");
-            let stats = stats_bytes(values);
-            let (stats_offset, stats_length) = writer
-                .write_fixed_width_values(&stats, std::mem::size_of::<i64>())
-                .expect("write stats");
+        let mut metas = Vec::with_capacity(chunks.len() * column_count);
+        for chunk in chunks {
+            for (index, values) in chunk.iter().enumerate() {
+                writer
+                    .pad_to_alignment(MIN_BUFFER_ALIGN as usize)
+                    .expect("align stats");
+                let stats = stats_bytes(values);
+                let (stats_offset, stats_length) = writer
+                    .write_fixed_width_values(&stats, std::mem::size_of::<i64>())
+                    .expect("write stats");
 
-            writer
-                .pad_to_alignment(VALUES_BUFFER_ALIGN)
-                .expect("align values");
-            let encoded = encode_i64(values);
-            let (data_offset, data_length) = writer
-                .write_fixed_width_values(&encoded, std::mem::size_of::<i64>())
-                .expect("write values");
+                writer
+                    .pad_to_alignment(VALUES_BUFFER_ALIGN)
+                    .expect("align values");
+                let encoded = encode_i64(values);
+                let (data_offset, data_length) = writer
+                    .write_fixed_width_values(&encoded, std::mem::size_of::<i64>())
+                    .expect("write values");
 
-            metas.push(ColumnMeta {
-                column_id: index as u32,
-                physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-                logical_type: 0,
-                data_offset,
-                data_length,
-                validity_offset: 0,
-                validity_length: 0,
-                offsets_offset: 0,
-                offsets_length: 0,
-                stats_offset,
-                stats_length,
-            });
+                metas.push(ColumnMeta {
+                    column_id: index as u32,
+                    physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
+                    logical_type: 0,
+                    data_offset,
+                    data_length,
+                    validity_offset: 0,
+                    validity_length: 0,
+                    offsets_offset: 0,
+                    offsets_length: 0,
+                    stats_offset,
+                    stats_length,
+                });
+            }
         }
 
         writer
@@ -591,8 +749,9 @@ mod tests {
             datafusion::logical_expr::col("a"),
             Expr::Literal(ScalarValue::Int64(Some(99))),
         );
-        let pruned = expr_proves_chunk_empty(&expr, &schema, &reader, &metrics, &mut stats_cache)
-            .expect("evaluate pruning");
+        let pruned =
+            expr_proves_chunk_empty(&expr, &schema, &reader, 0, &metrics, &mut stats_cache)
+                .expect("evaluate pruning");
 
         assert!(pruned);
         assert_eq!(metrics.stats_buffers_read(), 1);
@@ -637,5 +796,68 @@ mod tests {
             .expect("int64 array");
         assert_eq!(values.value(0), 20);
         assert_eq!(values.value(1), 30);
+    }
+
+    #[tokio::test]
+    async fn query_across_multiple_chunks_returns_all_rows() {
+        let file = write_chunked_test_file(&[&[&[1, 2], &[10, 20]], &[&[3, 4, 5], &[30, 40, 50]]]);
+        let mmap = MmapFile::open(file.path()).expect("mmap");
+        let provider =
+            Arc::new(ColumnarTableProvider::try_new(mmap.mmap_arc(), schema()).expect("provider"));
+        let metrics = provider.metrics();
+
+        let batches = collect_query("SELECT a, b FROM t ORDER BY a", provider).await;
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+        assert_eq!(metrics.data_buffers_read(), 4);
+
+        let a_values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 array");
+                (0..array.len())
+                    .map(|index| array.value(index))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(a_values, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn where_clause_skips_only_non_matching_chunks_and_reduces_scan_work() {
+        let file = write_chunked_test_file(&[
+            &[&[1, 2], &[10, 20]],
+            &[&[100, 200, 300], &[1000, 2000, 3000]],
+        ]);
+        let mmap = MmapFile::open(file.path()).expect("mmap");
+        let provider =
+            Arc::new(ColumnarTableProvider::try_new(mmap.mmap_arc(), schema()).expect("provider"));
+        let metrics = provider.metrics();
+
+        let batches = collect_query("SELECT b FROM t WHERE a >= 100", provider).await;
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        assert_eq!(metrics.stats_buffers_read(), 2);
+        assert_eq!(metrics.data_buffers_read(), 2);
+        assert_eq!(metrics.chunks_pruned(), 1);
+
+        let b_values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 array");
+                (0..array.len())
+                    .map(|index| array.value(index))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(b_values, vec![1000, 2000, 3000]);
     }
 }
