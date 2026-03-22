@@ -13,6 +13,7 @@
     # pkgs.nodePackages.nodemon
     pkgs.cargo
     pkgs.rustc
+    pkgs.gcc
   ];
 
   # Sets environment variables in the workspace

@@ -1,4 +1,4 @@
-'''use std::path::PathBuf;
+use std::path::PathBuf;
 use std::{env, process};
 
 use columnar_format::ColumnarReader;
@@ -26,4 +26,3 @@ fn main() {
     let path = PathBuf::from(&args[2]);
     inspect(path);
 }
-''

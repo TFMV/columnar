@@ -22,6 +22,18 @@ pub enum ColumnarType {
 }
 
 impl ColumnarType {
+    /// The number of bytes for a single element in a fixed-width column.
+    pub fn element_width(&self) -> Option<usize> {
+        match self {
+            Self::Int64 => Some(std::mem::size_of::<i64>()),
+            Self::Float64 => Some(std::mem::size_of::<f64>()),
+            // Booleans are bit-packed, so element width is not a whole number of bytes.
+            Self::Boolean => None,
+            // Variable-length types have no fixed element width for their data buffer.
+            Self::Utf8 | Self::LargeUtf8 => None,
+        }
+    }
+
     /// The number of bytes for the offset type in a variable-length column.
     pub fn offset_width(&self) -> Option<usize> {
         match self {
@@ -44,7 +56,7 @@ impl From<ColumnarType> for ArrowDataType {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedArrowType(pub ArrowDataType);
 
 impl std::fmt::Display for UnsupportedArrowType {
@@ -70,7 +82,7 @@ impl TryFrom<&ArrowDataType> for ColumnarType {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidColumnarType(pub u32);
 
 impl std::fmt::Display for InvalidColumnarType {

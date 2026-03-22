@@ -99,6 +99,13 @@ pub enum ColumnarWriteError {
         required_alignment: usize,
     },
     UnsupportedColumnType(ColumnarType),
+    InvalidChunkLayout(&'static str),
+    ChunkRowCountMismatch {
+        chunk_index: usize,
+        expected_rows: usize,
+        column_index: usize,
+        got_rows: usize,
+    },
 }
 
 impl core::fmt::Display for ColumnarWriteError {
@@ -166,6 +173,18 @@ impl core::fmt::Display for ColumnarWriteError {
             ColumnarWriteError::UnsupportedColumnType(t) => {
                 write!(f, "unsupported column type for write: {t:?}")
             }
+            ColumnarWriteError::InvalidChunkLayout(message) => {
+                write!(f, "invalid chunk layout: {message}")
+            }
+            ColumnarWriteError::ChunkRowCountMismatch {
+                chunk_index,
+                expected_rows,
+                column_index,
+                got_rows,
+            } => write!(
+                f,
+                "chunk {chunk_index} column {column_index} has {got_rows} rows, expected {expected_rows}"
+            ),
         }
     }
 }
@@ -441,9 +460,10 @@ impl ColumnarWriter {
                 "directory patch past end of buffer",
             ));
         }
+        let (logical_column_count, chunk_count) = infer_chunk_layout(entries)?;
+        validate_chunk_row_counts(entries, logical_column_count, chunk_count)?;
+
         let required_alignment = self.values_alignment.alignment();
-        let (logical_column_count, chunk_count) =
-            infer_chunk_layout(entries).map_err(ColumnarWriteError::State)?;
         for (index, entry) in entries.iter().enumerate() {
             if entry.data_length > 0 && entry.data_offset % required_alignment as u64 != 0 {
                 return Err(ColumnarWriteError::MisalignedDataOffset {
@@ -454,18 +474,18 @@ impl ColumnarWriter {
             }
             let start = self.dir_start + index * COLUMN_META_LEN;
             let entry_end = start + COLUMN_META_LEN;
-            entry
-                .serialize_into(&mut self.buf[start..entry_end])
-                .map_err(|_| ColumnarWriteError::State("directory serialize_into failed"))?;
+            entry.serialize(&mut self.buf[start..entry_end]);
         }
-        self.logical_column_count = logical_column_count;
-        self.chunk_count = chunk_count;
         self.dir_patched = true;
         Ok(())
     }
 
     /// Writes the final header at offset 0 (magic, version, offsets, lengths).
-    pub fn finalize_header(&mut self) -> Result<(), ColumnarWriteError> {
+    pub fn finalize_header_and_directory(
+        &mut self,
+        logical_column_count: u32,
+        chunk_count: u32,
+    ) -> Result<(), ColumnarWriteError> {
         if self.finalized {
             return Err(ColumnarWriteError::State("already finalized"));
         }
@@ -497,7 +517,7 @@ impl ColumnarWriter {
             column_dir_length,
             reserved: [0u8; 8],
         }
-        .with_chunk_layout(self.logical_column_count as u32, self.chunk_count as u32);
+        .with_chunk_layout(logical_column_count, chunk_count);
         header
             .validate()
             .map_err(|_| ColumnarWriteError::State("constructed header failed validate"))?;
@@ -693,9 +713,11 @@ fn validate_i64_offsets(offsets: &[u8], values_len: usize) -> Result<usize, Colu
     Ok(rows)
 }
 
-fn infer_chunk_layout(entries: &[ColumnMeta]) -> Result<(usize, usize), &'static str> {
+fn infer_chunk_layout(entries: &[ColumnMeta]) -> Result<(usize, usize), ColumnarWriteError> {
     if entries.is_empty() {
-        return Err("directory must contain at least one entry");
+        return Err(ColumnarWriteError::InvalidChunkLayout(
+            "directory must contain at least one entry",
+        ));
     }
 
     let mut max_column_id = 0u32;
@@ -704,15 +726,43 @@ fn infer_chunk_layout(entries: &[ColumnMeta]) -> Result<(usize, usize), &'static
     }
     let logical_column_count = max_column_id as usize + 1;
     if entries.len() % logical_column_count != 0 {
-        return Err("directory entries do not form whole chunks");
+        return Err(ColumnarWriteError::InvalidChunkLayout(
+            "directory entries do not form whole chunks",
+        ));
     }
     for (index, entry) in entries.iter().enumerate() {
         let expected_column_id = (index % logical_column_count) as u32;
         if entry.column_id != expected_column_id {
-            return Err("directory entries are not laid out chunk-major");
+            return Err(ColumnarWriteError::InvalidChunkLayout(
+                "directory entries are not laid out chunk-major",
+            ));
         }
     }
     Ok((logical_column_count, entries.len() / logical_column_count))
+}
+
+fn validate_chunk_row_counts(
+    entries: &[ColumnMeta],
+    logical_column_count: usize,
+    chunk_count: usize,
+) -> Result<(), ColumnarWriteError> {
+    for chunk_index in 0..chunk_count {
+        let first_column_index = chunk_index * logical_column_count;
+        let first_column_entry = &entries[first_column_index];
+        let expected_rows = first_column_entry.row_count();
+        for column_chunk_index in 1..logical_column_count {
+            let entry = &entries[first_column_index + column_chunk_index];
+            if entry.row_count() != expected_rows {
+                return Err(ColumnarWriteError::ChunkRowCountMismatch {
+                    chunk_index,
+                    expected_rows,
+                    column_index: entry.column_id as usize,
+                    got_rows: entry.row_count(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -804,7 +854,7 @@ mod tests {
         writer
             .patch_column_directory(std::slice::from_ref(&meta))
             .unwrap();
-        writer.finalize_header().unwrap();
+        writer.finalize_header_and_directory(1,1).unwrap();
 
         let reader = ColumnarReader::new(writer.as_slice()).unwrap();
         assert_eq!(reader.column_values(0).unwrap(), values.as_slice());
@@ -841,7 +891,7 @@ mod tests {
         writer
             .patch_column_directory(std::slice::from_ref(&meta))
             .unwrap();
-        writer.finalize_header().unwrap();
+        writer.finalize_header_and_directory(1,1).unwrap();
 
         let reader = ColumnarReader::new(writer.as_slice()).unwrap();
         let column = reader.variable_column_buffers(0).unwrap();

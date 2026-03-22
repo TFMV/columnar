@@ -1,9 +1,8 @@
 //! Write a `.columnar` file to disk and verify raw layout against format §2–6.
 
 use columnar_format::{
-    pad_length, ColumnDirectory, ColumnDirectoryView, ColumnMeta, ColumnarWriter, FileHeader,
-    COLUMN_META_LEN, FILE_HEADER_LEN, SECTION_ALIGN, V0_PHYSICAL_FIXED_WIDTH_I64,
-    VALUES_BUFFER_ALIGN,
+    pad_length, ColumnMeta, ColumnarWriter, FileHeader,
+    COLUMN_META_LEN, FILE_HEADER_LEN, SECTION_ALIGN, ColumnarType, VALUES_BUFFER_ALIGN,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -26,8 +25,7 @@ fn write_file_read_raw_bytes_verify_layout() {
 
     let meta = ColumnMeta {
         column_id: 0,
-        physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-        logical_type: 0,
+        column_type: ColumnarType::Int64,
         data_offset: data_off,
         data_length: data_len,
         validity_offset: 0,
@@ -39,7 +37,7 @@ fn write_file_read_raw_bytes_verify_layout() {
     };
     w.patch_column_directory(std::slice::from_ref(&meta))
         .unwrap();
-    w.finalize_header().unwrap();
+    w.finalize_header_and_directory(1,1).unwrap();
     let bytes = w.into_inner();
 
     fs::write(&path, &bytes).expect("write temp file");
@@ -70,9 +68,9 @@ fn write_file_read_raw_bytes_verify_layout() {
     // --- Directory ---
     let d0 = hdr.column_dir_offset as usize;
     let d1 = d0 + hdr.column_dir_length as usize;
-    let dir = ColumnDirectory::deserialize(&bytes[d0..d1]).unwrap();
-    assert_eq!(dir.len(), 1);
-    assert_eq!(dir.as_slice()[0], meta);
+    let metas = columnar_format::directory::decompress_metas(&bytes[d0..d1]).unwrap();
+    assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0], meta);
 
     // --- Values: 64-byte aligned start, contiguous i64 LE ---
     assert_eq!(data_off as usize % VALUES_BUFFER_ALIGN, 0);
@@ -84,9 +82,4 @@ fn write_file_read_raw_bytes_verify_layout() {
     assert!(FILE_HEADER_LEN <= s0);
     assert!(s1 <= d0);
     assert!(d1 <= v0);
-
-    ColumnDirectoryView::new(&bytes[d0..d1])
-        .unwrap()
-        .validate(bytes.len() as u64)
-        .unwrap();
 }

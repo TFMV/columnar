@@ -4,7 +4,6 @@ description = "Memory-mapping helpers for Columnar files"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [lib]
 path = "src/lib.rs"

@@ -538,26 +538,7 @@ mod tests {
         (format!("http://{addr}"), shutdown_tx, handle)
     }
 
-    fn go_proxy_url() -> Option<String> {
-        let output = Command::new("go")
-            .args(["env", "GOMODCACHE"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-
-        let module_cache = String::from_utf8(output.stdout).ok()?;
-        let module_cache = module_cache.trim();
-        if module_cache.is_empty() {
-            return None;
-        }
-
-        Some(format!("file://{module_cache}/cache/download"))
-    }
-
     fn run_go_interop_client(endpoint: &str, query: &str) -> Result<String, String> {
-        let go_proxy = go_proxy_url().ok_or_else(|| "go toolchain unavailable".to_string())?;
         let endpoint = endpoint
             .strip_prefix("http://")
             .ok_or_else(|| format!("unexpected endpoint format: {endpoint}"))?;
@@ -579,7 +560,7 @@ mod tests {
             .arg("download")
             .env("GOMODCACHE", &module_cache)
             .env("GOCACHE", &build_cache)
-            .env("GOPROXY", &go_proxy)
+            .env("GOPROXY", "https://proxy.golang.org,direct")
             .env("GOSUMDB", "off")
             .env("GOFLAGS", "-buildvcs=false");
         let download_output = download
@@ -601,7 +582,7 @@ mod tests {
             .arg(query)
             .env("GOMODCACHE", &module_cache)
             .env("GOCACHE", &build_cache)
-            .env("GOPROXY", &go_proxy)
+            .env("GOPROXY", "https://proxy.golang.org,direct")
             .env("GOSUMDB", "off")
             .env("GOFLAGS", "-buildvcs=false");
         let output = run
