@@ -636,6 +636,10 @@ dependencies = [
 [[package]]
 name = "columnar-cli"
 version = "0.1.0"
+dependencies = [
+ "columnar-format",
+ "columnar-mmap",
+]
 
 [[package]]
 name = "columnar-dfusion"
