@@ -1,8 +1,7 @@
 //! Typed on-disk stats blocks for chunk-level pruning.
 
+use crate::types::ColumnarType;
 use core::fmt;
-
-use crate::{V0_PHYSICAL_FIXED_WIDTH_I64, V0_PHYSICAL_UTF8_I32, V0_PHYSICAL_UTF8_I64};
 
 const INT64_STATS_FLAG_HAS_MIN_MAX: u64 = 1 << 0;
 const INT64_STATS_FLAG_HAS_DISTINCT_COUNT: u64 = 1 << 1;
@@ -29,15 +28,15 @@ pub enum ColumnStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatsBlockError {
     UnsupportedPhysicalType {
-        physical_type: u32,
+        physical_type: ColumnarType,
     },
     WrongLength {
-        physical_type: u32,
+        physical_type: ColumnarType,
         got: usize,
         expected: usize,
     },
     InvalidFlags {
-        physical_type: u32,
+        physical_type: ColumnarType,
         flags: u64,
     },
 }
@@ -45,26 +44,24 @@ pub enum StatsBlockError {
 impl fmt::Display for StatsBlockError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StatsBlockError::UnsupportedPhysicalType { physical_type } => {
-                write!(
-                    f,
-                    "physical type {physical_type} does not have a typed stats block"
-                )
-            }
+            StatsBlockError::UnsupportedPhysicalType { physical_type } => write!(
+                f,
+                "physical type {physical_type:?} does not have a typed stats block"
+            ),
             StatsBlockError::WrongLength {
                 physical_type,
                 got,
                 expected,
             } => write!(
                 f,
-                "physical type {physical_type} stats length {got} does not match expected {expected}"
+                "physical type {physical_type:?} stats length {got} does not match expected {expected}"
             ),
             StatsBlockError::InvalidFlags {
                 physical_type,
                 flags,
             } => write!(
                 f,
-                "physical type {physical_type} stats flags {flags:#x} are invalid"
+                "physical type {physical_type:?} stats flags {flags:#x} are invalid"
             ),
         }
     }
@@ -101,7 +98,7 @@ impl Int64Stats {
     pub fn deserialize(bytes: &[u8]) -> Result<Self, StatsBlockError> {
         if bytes.len() != Self::SERIALIZED_LEN {
             return Err(StatsBlockError::WrongLength {
-                physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
+                physical_type: ColumnarType::Int64,
                 got: bytes.len(),
                 expected: Self::SERIALIZED_LEN,
             });
@@ -117,7 +114,7 @@ impl Int64Stats {
 
         if flags & !(INT64_STATS_FLAG_HAS_MIN_MAX | INT64_STATS_FLAG_HAS_DISTINCT_COUNT) != 0 {
             return Err(StatsBlockError::InvalidFlags {
-                physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
+                physical_type: ColumnarType::Int64,
                 flags,
             });
         }
@@ -141,13 +138,15 @@ impl Int64Stats {
 
 impl ColumnStats {
     #[inline]
-    pub fn deserialize(physical_type: u32, bytes: &[u8]) -> Result<Self, StatsBlockError> {
-        match physical_type {
-            V0_PHYSICAL_FIXED_WIDTH_I64 => Ok(Self::Int64(Int64Stats::deserialize(bytes)?)),
-            V0_PHYSICAL_UTF8_I32 | V0_PHYSICAL_UTF8_I64 => {
-                Err(StatsBlockError::UnsupportedPhysicalType { physical_type })
-            }
-            _ => Err(StatsBlockError::UnsupportedPhysicalType { physical_type }),
+    pub fn deserialize(column_type: ColumnarType, bytes: &[u8]) -> Result<Self, StatsBlockError> {
+        match column_type {
+            ColumnarType::Int64 => Ok(Self::Int64(Int64Stats::deserialize(bytes)?)),
+            ColumnarType::Utf8 | ColumnarType::LargeUtf8 => Err(StatsBlockError::UnsupportedPhysicalType {
+                physical_type: column_type,
+            }),
+            _ => Err(StatsBlockError::UnsupportedPhysicalType {
+                physical_type: column_type,
+            }),
         }
     }
 }

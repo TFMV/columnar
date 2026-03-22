@@ -4,12 +4,19 @@ description = "Columnar file format definitions and layout structures"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+arrow-schema = "54.3.1"
+byteorder = "1.5.0"
+zstd = "0.13.1"
 
 [dev-dependencies]
 arrow-array = "54.3.1"
 columnar-arrow = { path = "../columnar-arrow" }
 columnar-mmap = { path = "../columnar-mmap" }
+
+[features]
+arrow-conversion = []

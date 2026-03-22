@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use columnar_arrow::buffer::ArrowBuildError;
 use columnar_arrow::build_array;
 use columnar_format::{
     ColumnarReadError, ColumnarReader, ColumnarType, Int64Stats, UnsupportedArrowType,
@@ -64,6 +65,7 @@ pub enum ColumnarTableProviderError {
     },
     StatisticsOverflow(&'static str),
     RecordBatch(arrow_schema::ArrowError),
+    ArrowBuild(ArrowBuildError),
 }
 
 impl std::fmt::Display for ColumnarTableProviderError {
@@ -82,6 +84,7 @@ impl std::fmt::Display for ColumnarTableProviderError {
                 write!(f, "statistics overflow while computing {context}")
             }
             Self::RecordBatch(err) => write!(f, "record batch error: {err}"),
+            Self::ArrowBuild(err) => write!(f, "arrow build error: {err}"),
         }
     }
 }
@@ -103,6 +106,18 @@ impl From<UnsupportedArrowType> for ColumnarTableProviderError {
 impl From<arrow_schema::ArrowError> for ColumnarTableProviderError {
     fn from(value: arrow_schema::ArrowError) -> Self {
         Self::RecordBatch(value)
+    }
+}
+
+impl From<ArrowBuildError> for ColumnarTableProviderError {
+    fn from(value: ArrowBuildError) -> Self {
+        Self::ArrowBuild(value)
+    }
+}
+
+impl From<std::convert::Infallible> for ColumnarTableProviderError {
+    fn from(e: std::convert::Infallible) -> Self {
+        match e {}
     }
 }
 
@@ -164,7 +179,7 @@ impl ColumnarTableProvider {
         // Validate that all columns in the file have a type mapping supported by this provider.
         for index in 0..reader.column_count() {
             let meta = reader.chunk_column_meta(0, index)?;
-            let _ = ColumnarType::try_from(meta.column_type)?;
+            let _ = ColumnarType::try_from(meta.column_type).unwrap();
         }
 
         Ok(Self {
@@ -234,12 +249,11 @@ impl ColumnarDataSource {
                 .fetch_add(1, Ordering::Relaxed);
 
             let meta = reader.chunk_column_meta(chunk_index, index)?;
-            let s = reader.column_buffers(chunk_index, index)?;
+            let s = reader.chunk_column_buffers(chunk_index, index)?;
 
             let array = build_array(
                 self.mmap.clone(),
                 meta.column_type,
-                s.rows,
                 s.values,
                 s.validity,
                 s.offsets,
@@ -250,7 +264,8 @@ impl ColumnarDataSource {
         if columns.is_empty() && self.exact_row_count() > 0 {
             // No columns are projected, but there are rows. Return a batch with the correct row count.
             let row_count = self.chunk_row_counts[chunk_index];
-            return RecordBatch::try_new(projected_schema, vec![]).map_err(Into::into).and_then(|batch| Ok(batch.slice(0, row_count.min(batch.num_rows()))));
+            let batch = RecordBatch::try_new(projected_schema, vec![])?;
+            return Ok(batch.slice(0, row_count.min(batch.num_rows())));
         }
 
         RecordBatch::try_new(projected_schema, columns).map_err(Into::into)
@@ -687,7 +702,7 @@ fn reverse_operator(op: Operator) -> Operator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, Int64Array, StringArray};
+    use arrow_array::{Array, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
     use columnar_format::{ColumnarWriter, Int64Stats};
     use columnar_mmap::MmapFile;
@@ -730,7 +745,7 @@ mod tests {
     }
 
     fn encode_validity(mask: &[bool]) -> Vec<u8> {
-        let mut bitmap = vec![0u8; mask.len().div_ceil(8)];
+        let mut bitmap = vec![0u8; (mask.len() + 7) / 8];
         for (index, valid) in mask.iter().copied().enumerate() {
             if valid {
                 bitmap[index / 8] |= 1u8 << (index % 8);
@@ -785,8 +800,7 @@ mod tests {
         writer
             .patch_column_directory(&metas)
             .expect("patch directory");
-        writer.finalize_header().expect("finalize header");
-
+        writer.finalize_header_and_directory(column_count as u32, chunks.len() as u32 ).expect("finalize header");
         let file = NamedTempFile::new().expect("temp file");
         std::fs::write(file.path(), writer.into_inner()).expect("write file");
         file

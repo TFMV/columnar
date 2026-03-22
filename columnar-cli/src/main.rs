@@ -1,22 +1,15 @@
-use std::fs::File;
-use std::io::Read;
 use std::path::PathBuf;
 use std::{env, process};
 
-use columnar_format::{ColumnarReader, FileHeader, FILE_HEADER_LEN};
+use columnar_format::ColumnarReader;
 
 fn inspect(path: PathBuf) {
-    let mut f = File::open(&path).unwrap();
-    let mut buffer = [0u8; FILE_HEADER_LEN];
-    f.read_exact(&mut buffer).unwrap();
-    let header = FileHeader::deserialize(&buffer).unwrap();
-    header.validate().unwrap();
+    let mmap = columnar_mmap::MmapFile::open(&path).unwrap();
+    let bytes = mmap.as_slice();
+    let reader = ColumnarReader::new(bytes).unwrap();
 
     println!("--- Header ---");
-    println!("{:?}", header);
-
-    let mmap = columnar_mmap::MmapFile::open(&path).unwrap();
-    let reader = ColumnarReader::new(mmap.as_slice()).unwrap();
+    println!("{:?}", reader.header());
 
     println!("--- Column Directory ---");
     for i in 0..reader.column_count() {

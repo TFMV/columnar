@@ -1,61 +1,73 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{ArrowError, Schema, SchemaRef};
-use columnar_format::compat::Section;
+use arrow_schema::{ArrowError, SchemaRef};
 use columnar_format::ColumnarReader;
+use memmap2::Mmap;
+
+use crate::buffer::ArrowBuildError;
 
 pub mod buffer;
 pub mod int64;
 pub mod utf8;
 
-puse buffer::MmapBuffer;
 pub use int64::build_int64_array;
 pub use utf8::{build_large_utf8_array, build_utf8_array};
 
 /// A memory-mapped Arrow record batch stream.
 #[derive(Debug)]
-pub struct MmapRecordBatchStream {
+pub struct MmapRecordBatchStream<'a> {
     schema: SchemaRef,
-    reader: ColumnarReader, // Keep a reference to the MmapFile
+    reader: ColumnarReader<'a>,
     chunk: usize,
+    mmap: Arc<Mmap>,
 }
 
-impl MmapRecordBatchStream {
-    pub fn new(schema: SchemaRef, reader: ColumnarReader) -> Self {
-        Self { schema, reader, chunk: 0 }
+impl<'a> MmapRecordBatchStream<'a> {
+    pub fn new(schema: SchemaRef, reader: ColumnarReader<'a>, mmap: Arc<Mmap>) -> Self {
+        Self {
+            schema,
+            reader,
+            chunk: 0,
+            mmap,
+        }
     }
 }
 
-impl Iterator for MmapRecordBatchStream {
+impl<'a> Iterator for MmapRecordBatchStream<'a> {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.chunk >= self.reader.num_chunks() {
+        if self.chunk >= self.reader.chunk_count() {
             return None;
         }
 
         let mut columns = Vec::new();
         for (i, field) in self.schema.fields().iter().enumerate() {
-            let col_id = i as u32;
-
             let columnar_type = match field.data_type() {
                 arrow_schema::DataType::Int64 => Some(columnar_format::ColumnarType::Int64),
                 arrow_schema::DataType::Utf8 => Some(columnar_format::ColumnarType::Utf8),
-                arrow_schema::DataType::LargeUtf8 => Some(columnar_format::ColumnarType::LargeUtf8),
+                arrow_schema::DataType::LargeUtf8 => {
+                    Some(columnar_format::ColumnarType::LargeUtf8)
+                }
                 _ => None,
             };
 
             if let Some(columnar_type) = columnar_type {
-                let buffers = self.reader.column_buffers_by_id(col_id, self.chunk as u32).ok()?;
+                let buffers = self.reader.chunk_column_buffers(self.chunk, i).ok()?;
 
-                let array = build_array(
+                let array_result = build_array(
+                    self.mmap.clone(),
                     columnar_type,
-                    buffers.rows,
-                    buffers.values.cloned(),
-                    buffers.validity.cloned(),
-                    buffers.offsets.cloned(),
+                    buffers.values,
+                    buffers.validity,
+                    buffers.offsets,
                 );
+
+                let array = match array_result {
+                    Ok(arr) => arr,
+                    Err(e) => return Some(Err(e.into())),
+                };
 
                 columns.push(array);
             } else {
@@ -69,31 +81,34 @@ impl Iterator for MmapRecordBatchStream {
 }
 
 pub fn build_array(
+    mmap: Arc<Mmap>,
     column_type: columnar_format::ColumnarType,
-    rows: usize,
-    values: Option<MmapBuffer>,
-    validity: Option<MmapBuffer>,
-    offsets: Option<MmapBuffer>,
-) -> ArrayRef {
+    values: &[u8],
+    validity: Option<&[u8]>,
+    offsets: Option<&[u8]>,
+) -> Result<ArrayRef, ArrowBuildError> {
     match column_type {
-        columnar_format::ColumnarType::Int64 => Arc::new(build_int64_array(
-            rows,
-            values.expect("values buffer for int64"),
-            validity,
-        )),
-        columnar_format::ColumnarType::Utf8 => Arc::new(build_utf8_array(
-            rows,
+        columnar_format::ColumnarType::Int64 => {
+            Ok(Arc::new(build_int64_array(mmap, values, validity)?))
+        }
+        columnar_format::ColumnarType::Utf8 => Ok(Arc::new(build_utf8_array(
+            mmap,
             offsets.expect("offsets buffer for utf8"),
-            values.expect("values buffer for utf8"),
+            values,
             validity,
-        )),
-        columnar_format::ColumnarType::LargeUtf8 => Arc::new(build_large_utf8_array(
-            rows,
+        )?)),
+        columnar_format::ColumnarType::LargeUtf8 => Ok(Arc::new(build_large_utf8_array(
+            mmap,
             offsets.expect("offsets buffer for large utf8"),
-            values.expect("values buffer for large utf8"),
+            values,
             validity,
-        )),
-        // Handle other types here
+        )?)),
         _ => panic!("Unsupported column type"),
+    }
+}
+
+impl From<ArrowBuildError> for ArrowError {
+    fn from(e: ArrowBuildError) -> Self {
+        ArrowError::ExternalError(Box::new(e))
     }
 }

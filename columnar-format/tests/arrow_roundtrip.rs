@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::{Array, Int64Array, StringArray};
 use columnar_arrow::{build_int64_array, build_utf8_array};
-use columnar_format::{ColumnarReader, ColumnarWriter, Int64Stats};
+use columnar_format::{ColumnarReader, ColumnarType, ColumnarWriter, Int64Stats};
 use columnar_mmap::MmapFile;
 
 enum TestColumn<'a> {
@@ -94,16 +94,15 @@ fn write_chunks(chunks: &[Vec<TestColumn<'_>>]) -> Vec<u8> {
                 TestColumn::Int64(array) => writer
                     .write_int64_column_chunk(
                         column_id as u32,
-                        0,
                         &encode_int64_values(array),
                         encode_validity(*array).as_deref(),
                         Some(int64_stats(array)),
                     )
                     .expect("write int64 chunk"),
                 TestColumn::Utf8(array) => writer
-                    .write_utf8_i32_column_chunk(
+                    .write_variable_column_chunk(
                         column_id as u32,
-                        0,
+                        ColumnarType::Utf8,
                         &encode_utf8_offsets(array),
                         array.value_data(),
                         encode_validity(*array).as_deref(),
@@ -118,7 +117,7 @@ fn write_chunks(chunks: &[Vec<TestColumn<'_>>]) -> Vec<u8> {
     writer
         .patch_column_directory(&metas)
         .expect("patch directory");
-    writer.finalize_header().expect("finalize header");
+    writer.finalize_header_and_directory(column_count as u32, chunks.len() as u32).expect("finalize header");
     writer.into_inner()
 }
 

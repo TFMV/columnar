@@ -1,27 +1,21 @@
-//! On-disk format layout, headers, and related structs for Columnar.
+#![allow(dead_code)]
 
-mod align;
-mod directory;
-mod header;
-mod reader;
-mod stats;
+pub mod directory;
+pub mod error;
+pub mod header;
+pub mod stats;
 pub mod types;
-mod writer;
+pub mod writer;
+pub mod align;
 
-pub use align::{align_offset, pad_length};
-pub use directory::{
-    BufferField, ColumnDirectory, ColumnDirectoryError, ColumnDirectoryView, ColumnMeta,
-    COLUMN_META_LEN, MIN_BUFFER_ALIGN,
-};
-pub use header::{
-    FileHeader, FileHeaderError, FILE_FLAG_VALUES_ALIGNED_64, FILE_HEADER_LEN, FILE_HEADER_MAGIC,
-    FILE_HEADER_ON_DISK_SIZE, FILE_HEADER_STRUCT_LEN, FILE_HEADER_VERSION,
-};
-pub use reader::{
-    ColumnBufferSlices, ColumnarReadError, ColumnarReader, VariableColumnBufferSlices,
-};
+pub use directory::{ColumnMeta, COLUMN_META_LEN};
+pub use error::{ColumnarError, ColumnarErrorType};
+pub use header::{FileHeader, FILE_HEADER_LEN};
 pub use stats::{ColumnStats, Int64Stats, StatsBlockError};
-pub use types::{ColumnarType, InvalidColumnarType, UnsupportedArrowType};
-pub use writer::{
-    ColumnarWriteError, ColumnarWriter, ValueAlignmentStrategy, SECTION_ALIGN, VALUES_BUFFER_ALIGN,
-};
+pub use types::{ColumnarType, UnsupportedArrowType};
+pub use writer::{ColumnarWriter, ValueAlignmentStrategy};
+
+pub use align::{pad_length, MIN_BUFFER_ALIGN, SECTION_ALIGN, VALUES_BUFFER_ALIGN};
+
+mod reader;
+pub use reader::{ColumnarReadError, ColumnarReader};

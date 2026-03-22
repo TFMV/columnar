@@ -22,7 +22,7 @@ pub const FILE_HEADER_STRUCT_LEN: usize = 56;
 /// The on-disk record is always [`FILE_HEADER_LEN`] bytes: this layout (56 bytes) followed by 8
 /// padding bytes. [`FileHeader::serialize`] writes zeros in that tail; [`FileHeader::deserialize`]
 /// requires exactly 64 bytes and ignores the content of the tail (it is not stored).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct FileHeader {
     pub magic: [u8; 8],

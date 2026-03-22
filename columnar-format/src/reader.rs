@@ -2,20 +2,19 @@
 
 use core::fmt;
 
-use crate::directory::{
-    BufferField, ColumnDirectoryError, ColumnDirectoryView, ColumnMeta, COLUMN_META_LEN,
-    MIN_BUFFER_ALIGN,
-};
+use crate::directory::{ColumnMeta, COLUMN_META_LEN};
+use crate::error::{ColumnarError, ColumnarErrorType};
 use crate::header::{FileHeader, FileHeaderError, FILE_HEADER_LEN};
 use crate::stats::{ColumnStats, Int64Stats, StatsBlockError};
-use crate::{V0_PHYSICAL_FIXED_WIDTH_I64, V0_PHYSICAL_UTF8_I32, V0_PHYSICAL_UTF8_I64};
+use crate::types::ColumnarType;
+use crate::MIN_BUFFER_ALIGN;
 
 /// Parsed file with all payload views borrowing `bytes` (typically memory-mapped).
 #[derive(Debug, Clone, Copy)]
 pub struct ColumnarReader<'a> {
     bytes: &'a [u8],
     header: FileHeader,
-    directory: ColumnDirectoryView<'a>,
+    metas: &'a [ColumnMeta],
     logical_column_count: usize,
     chunk_count: usize,
     schema_start: usize,
@@ -45,12 +44,8 @@ pub struct VariableColumnBufferSlices<'a> {
 /// Errors from opening or walking a Columnar file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnarReadError {
-    TooSmall {
-        need: usize,
-        got: usize,
-    },
+    Columnar(ColumnarError),
     Header(FileHeaderError),
-    Directory(ColumnDirectoryError),
     RangeOverflow,
     FileTooLargeForPlatform,
     OutOfBounds {
@@ -73,13 +68,13 @@ pub enum ColumnarReadError {
     },
     UnalignedBuffer {
         column_index: usize,
-        field: BufferField,
+        field: &'static str,
         offset: u64,
         required_alignment: u64,
     },
     BufferOverlapsStructure {
         column_index: usize,
-        field: BufferField,
+        field: &'static str,
         start: u64,
         end: u64,
     },
@@ -104,7 +99,7 @@ pub enum ColumnarReadError {
     },
     UnsupportedPhysicalType {
         column_index: usize,
-        physical_type: u32,
+        physical_type: ColumnarType,
     },
     Stats {
         column_index: usize,
@@ -115,11 +110,8 @@ pub enum ColumnarReadError {
 impl fmt::Display for ColumnarReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ColumnarReadError::TooSmall { need, got } => {
-                write!(f, "file too small: need at least {need} bytes, got {got}")
-            }
+            ColumnarReadError::Columnar(e) => write!(f, "columnar: {e}"),
             ColumnarReadError::Header(e) => write!(f, "header: {e}"),
-            ColumnarReadError::Directory(e) => write!(f, "directory: {e}"),
             ColumnarReadError::RangeOverflow => write!(f, "offset/length overflow"),
             ColumnarReadError::FileTooLargeForPlatform => {
                 write!(
@@ -208,7 +200,7 @@ impl fmt::Display for ColumnarReadError {
                 physical_type,
             } => write!(
                 f,
-                "column {column_index} uses unsupported physical type {physical_type}"
+                "column {column_index} uses unsupported physical type {physical_type:?}"
             ),
             ColumnarReadError::Stats {
                 column_index,
@@ -234,9 +226,9 @@ impl From<FileHeaderError> for ColumnarReadError {
     }
 }
 
-impl From<ColumnDirectoryError> for ColumnarReadError {
-    fn from(value: ColumnDirectoryError) -> Self {
-        ColumnarReadError::Directory(value)
+impl From<ColumnarError> for ColumnarReadError {
+    fn from(value: ColumnarError) -> Self {
+        ColumnarReadError::Columnar(value)
     }
 }
 
@@ -245,10 +237,14 @@ impl<'a> ColumnarReader<'a> {
     /// directory buffer graph (bounds, alignment, non-overlap), and isolation from structural regions.
     pub fn new(bytes: &'a [u8]) -> Result<Self, ColumnarReadError> {
         if bytes.len() < FILE_HEADER_LEN {
-            return Err(ColumnarReadError::TooSmall {
-                need: FILE_HEADER_LEN,
-                got: bytes.len(),
-            });
+            return Err(ColumnarReadError::Columnar(ColumnarError::new(
+                ColumnarErrorType::Corrupt,
+                format!(
+                    "file too small: need at least {} bytes, got {}",
+                    FILE_HEADER_LEN,
+                    bytes.len()
+                ),
+            )));
         }
         let header = FileHeader::deserialize(&bytes[..FILE_HEADER_LEN])?;
         header.validate()?;
@@ -265,7 +261,7 @@ impl<'a> ColumnarReader<'a> {
                 min: FILE_HEADER_LEN as u64,
             });
         }
-        if header.schema_offset % MIN_BUFFER_ALIGN != 0 {
+        if header.schema_offset % MIN_BUFFER_ALIGN as u64 != 0 {
             return Err(ColumnarReadError::SchemaStartNotAligned {
                 offset: header.schema_offset,
             });
@@ -274,19 +270,21 @@ impl<'a> ColumnarReader<'a> {
         let (dir_start, dir_end) =
             u64_range_to_usize(header.column_dir_offset, header.column_dir_length, file_len)?;
 
-        if header.column_dir_offset % MIN_BUFFER_ALIGN != 0 {
+        if header.column_dir_offset % MIN_BUFFER_ALIGN as u64 != 0 {
             return Err(ColumnarReadError::DirectoryStartNotAligned {
                 offset: header.column_dir_offset,
             });
         }
 
         if (dir_end - dir_start) % COLUMN_META_LEN != 0 {
-            return Err(ColumnarReadError::Directory(
-                ColumnDirectoryError::WrongDirectoryLength {
-                    got: dir_end - dir_start,
-                    multiple_of: COLUMN_META_LEN,
-                },
-            ));
+            return Err(ColumnarReadError::Columnar(ColumnarError::new(
+                ColumnarErrorType::Corrupt,
+                format!(
+                    "Invalid column directory length: {}, expected multiple of {}",
+                    dir_end - dir_start,
+                    COLUMN_META_LEN
+                ),
+            )));
         }
 
         // Layout: schema payload precedes column directory (format §2.1).
@@ -300,15 +298,14 @@ impl<'a> ColumnarReader<'a> {
             });
         }
 
-        let directory = ColumnDirectoryView::new(&bytes[dir_start..dir_end])?;
-        directory.validate(file_len)?;
+        let metas = crate::directory::decompress_metas(&bytes[dir_start..dir_end])?;
 
-        let (logical_column_count, chunk_count) = validate_chunk_layout(header, directory)?;
+        let (logical_column_count, chunk_count) = validate_chunk_layout(header, &metas)?;
 
         let reader = Self {
             bytes,
             header,
-            directory,
+            metas: metas.leak(),
             logical_column_count,
             chunk_count,
             schema_start,
@@ -334,8 +331,8 @@ impl<'a> ColumnarReader<'a> {
     }
 
     #[inline]
-    pub fn directory_view(&self) -> ColumnDirectoryView<'a> {
-        self.directory
+    pub fn metas(&self) -> &'a [ColumnMeta] {
+        self.metas
     }
 
     #[inline]
@@ -360,13 +357,13 @@ impl<'a> ColumnarReader<'a> {
         column_index: usize,
     ) -> Result<ColumnMeta, ColumnarReadError> {
         let entry_index = self.entry_index(chunk_index, column_index)?;
-        Ok(self.directory.get(entry_index)?)
+        Ok(self.metas[entry_index])
     }
 
     /// Values buffer for column `index` (may be empty if `data_length == 0`).
     pub fn column_values(&self, index: usize) -> Result<&'a [u8], ColumnarReadError> {
         let m = self.column_meta(index)?;
-        self.slice_buffer(index, BufferField::Data, m.data_offset, m.data_length)
+        self.slice_buffer(index, "Data", m.data_offset, m.data_length)
     }
 
     pub fn chunk_column_values(
@@ -375,22 +372,12 @@ impl<'a> ColumnarReader<'a> {
         column_index: usize,
     ) -> Result<&'a [u8], ColumnarReadError> {
         let m = self.chunk_column_meta(chunk_index, column_index)?;
-        self.slice_buffer(
-            column_index,
-            BufferField::Data,
-            m.data_offset,
-            m.data_length,
-        )
+        self.slice_buffer(column_index, "Data", m.data_offset, m.data_length)
     }
 
     pub fn column_validity(&self, index: usize) -> Result<Option<&'a [u8]>, ColumnarReadError> {
         let m = self.column_meta(index)?;
-        self.optional_slice_buffer(
-            index,
-            BufferField::Validity,
-            m.validity_offset,
-            m.validity_length,
-        )
+        self.optional_slice_buffer(index, "Validity", m.validity_offset, m.validity_length)
     }
 
     pub fn chunk_column_validity(
@@ -401,7 +388,7 @@ impl<'a> ColumnarReader<'a> {
         let m = self.chunk_column_meta(chunk_index, column_index)?;
         self.optional_slice_buffer(
             column_index,
-            BufferField::Validity,
+            "Validity",
             m.validity_offset,
             m.validity_length,
         )
@@ -409,12 +396,7 @@ impl<'a> ColumnarReader<'a> {
 
     pub fn column_offsets(&self, index: usize) -> Result<Option<&'a [u8]>, ColumnarReadError> {
         let m = self.column_meta(index)?;
-        self.optional_slice_buffer(
-            index,
-            BufferField::Offsets,
-            m.offsets_offset,
-            m.offsets_length,
-        )
+        self.optional_slice_buffer(index, "Offsets", m.offsets_offset, m.offsets_length)
     }
 
     pub fn chunk_column_offsets(
@@ -423,17 +405,12 @@ impl<'a> ColumnarReader<'a> {
         column_index: usize,
     ) -> Result<Option<&'a [u8]>, ColumnarReadError> {
         let m = self.chunk_column_meta(chunk_index, column_index)?;
-        self.optional_slice_buffer(
-            column_index,
-            BufferField::Offsets,
-            m.offsets_offset,
-            m.offsets_length,
-        )
+        self.optional_slice_buffer(column_index, "Offsets", m.offsets_offset, m.offsets_length)
     }
 
     pub fn column_stats(&self, index: usize) -> Result<Option<&'a [u8]>, ColumnarReadError> {
         let m = self.column_meta(index)?;
-        self.optional_slice_buffer(index, BufferField::Stats, m.stats_offset, m.stats_length)
+        self.optional_slice_buffer(index, "Stats", m.stats_offset, m.stats_length)
     }
 
     pub fn chunk_column_stats(
@@ -442,12 +419,7 @@ impl<'a> ColumnarReader<'a> {
         column_index: usize,
     ) -> Result<Option<&'a [u8]>, ColumnarReadError> {
         let m = self.chunk_column_meta(chunk_index, column_index)?;
-        self.optional_slice_buffer(
-            column_index,
-            BufferField::Stats,
-            m.stats_offset,
-            m.stats_length,
-        )
+        self.optional_slice_buffer(column_index, "Stats", m.stats_offset, m.stats_length)
     }
 
     pub fn column_typed_stats(
@@ -466,7 +438,7 @@ impl<'a> ColumnarReader<'a> {
         let Some(stats) = self.chunk_column_stats(chunk_index, column_index)? else {
             return Ok(None);
         };
-        ColumnStats::deserialize(meta.physical_type, stats)
+        ColumnStats::deserialize(meta.column_type, stats)
             .map(Some)
             .map_err(|source| ColumnarReadError::Stats {
                 column_index,
@@ -488,7 +460,7 @@ impl<'a> ColumnarReader<'a> {
     ) -> Result<Option<Int64Stats>, ColumnarReadError> {
         match self.chunk_column_typed_stats(chunk_index, column_index)? {
             Some(ColumnStats::Int64(stats)) => Ok(Some(stats)),
-            None => Ok(None),
+            _ => Ok(None),
         }
     }
 
@@ -577,13 +549,13 @@ impl<'a> ColumnarReader<'a> {
 
         let structural = [(0u64, hdr_end), (schema0, schema1), (dir0, dir1)];
 
-        for i in 0..self.directory.len() {
-            let m = self.directory.get(i)?;
+        for i in 0..self.metas.len() {
+            let m = self.metas[i];
             for (field, off, len) in [
-                (BufferField::Data, m.data_offset, m.data_length),
-                (BufferField::Validity, m.validity_offset, m.validity_length),
-                (BufferField::Offsets, m.offsets_offset, m.offsets_length),
-                (BufferField::Stats, m.stats_offset, m.stats_length),
+                ("Data", m.data_offset, m.data_length),
+                ("Validity", m.validity_offset, m.validity_length),
+                ("Offsets", m.offsets_offset, m.offsets_length),
+                ("Stats", m.stats_offset, m.stats_length),
             ] {
                 if len == 0 {
                     continue;
@@ -625,7 +597,7 @@ impl<'a> ColumnarReader<'a> {
     fn slice_buffer(
         &self,
         column_index: usize,
-        field: BufferField,
+        field: &'static str,
         offset: u64,
         length: u64,
     ) -> Result<&'a [u8], ColumnarReadError> {
@@ -648,7 +620,7 @@ impl<'a> ColumnarReader<'a> {
     fn optional_slice_buffer(
         &self,
         column_index: usize,
-        field: BufferField,
+        field: &'static str,
         offset: u64,
         length: u64,
     ) -> Result<Option<&'a [u8]>, ColumnarReadError> {
@@ -669,29 +641,33 @@ impl<'a> ColumnarReader<'a> {
         column_index: usize,
     ) -> Result<usize, ColumnarReadError> {
         if column_index >= self.logical_column_count {
-            return Err(ColumnarReadError::Directory(
-                ColumnDirectoryError::InvalidColumnIndex {
-                    index: column_index,
-                    len: self.logical_column_count,
-                },
-            ));
+            return Err(ColumnarReadError::Columnar(ColumnarError::new(
+                ColumnarErrorType::Invalid,
+                format!(
+                    "Invalid column index: {}, logical column count: {}",
+                    column_index,
+                    self.logical_column_count
+                ),
+            )));
         }
         if chunk_index >= self.chunk_count {
-            return Err(ColumnarReadError::Directory(
-                ColumnDirectoryError::InvalidColumnIndex {
-                    index: chunk_index,
-                    len: self.chunk_count,
-                },
-            ));
+            return Err(ColumnarReadError::Columnar(ColumnarError::new(
+                ColumnarErrorType::Invalid,
+                format!(
+                    "Invalid chunk index: {}, chunk count: {}",
+                    chunk_index,
+                    self.chunk_count
+                ),
+            )));
         }
         Ok(chunk_index * self.logical_column_count + column_index)
     }
 
     #[inline]
-    fn required_alignment_for(&self, field: BufferField) -> u64 {
+    fn required_alignment_for(&self, field: &'static str) -> u64 {
         match field {
-            BufferField::Data if self.header.values_are_64_aligned() => 64,
-            _ => MIN_BUFFER_ALIGN,
+            "Data" if self.header.values_are_64_aligned() => 64,
+            _ => MIN_BUFFER_ALIGN as u64,
         }
     }
 
@@ -733,25 +709,25 @@ impl<'a> ColumnarReader<'a> {
         column_index: usize,
     ) -> Result<usize, ColumnarReadError> {
         let meta = self.chunk_column_meta(chunk_index, column_index)?;
-        match meta.physical_type {
-            V0_PHYSICAL_FIXED_WIDTH_I64 => Ok((meta.data_length / 8) as usize),
-            V0_PHYSICAL_UTF8_I32 => {
+        match meta.column_type {
+            ColumnarType::Int64 => Ok((meta.data_length / 8) as usize),
+            ColumnarType::Utf8 => {
                 let offsets_len = meta.offsets_length as usize;
                 if offsets_len < std::mem::size_of::<i32>() {
                     return Ok(0);
                 }
                 Ok(offsets_len / std::mem::size_of::<i32>() - 1)
             }
-            V0_PHYSICAL_UTF8_I64 => {
+            ColumnarType::LargeUtf8 => {
                 let offsets_len = meta.offsets_length as usize;
                 if offsets_len < std::mem::size_of::<i64>() {
                     return Ok(0);
                 }
                 Ok(offsets_len / std::mem::size_of::<i64>() - 1)
             }
-            physical_type => Err(ColumnarReadError::UnsupportedPhysicalType {
+            column_type => Err(ColumnarReadError::UnsupportedPhysicalType {
                 column_index,
-                physical_type,
+                physical_type: column_type,
             }),
         }
     }
@@ -759,9 +735,9 @@ impl<'a> ColumnarReader<'a> {
 
 fn validate_chunk_layout(
     header: FileHeader,
-    directory: ColumnDirectoryView<'_>,
+    metas: &[ColumnMeta],
 ) -> Result<(usize, usize), ColumnarReadError> {
-    if directory.is_empty() {
+    if metas.is_empty() {
         return Err(ColumnarReadError::EmptyDirectory);
     }
 
@@ -773,29 +749,29 @@ fn validate_chunk_layout(
             )
         } else {
             let mut max_column_id = 0u32;
-            for entry_index in 0..directory.len() {
-                max_column_id = max_column_id.max(directory.get(entry_index)?.column_id);
+            for meta in metas {
+                max_column_id = max_column_id.max(meta.column_id);
             }
             let logical_column_count = max_column_id as usize + 1;
-            if directory.len() % logical_column_count != 0 {
+            if metas.len() % logical_column_count != 0 {
                 return Err(ColumnarReadError::IncompleteChunkSet {
-                    entries: directory.len(),
+                    entries: metas.len(),
                     logical_columns: logical_column_count,
                 });
             }
-            (logical_column_count, directory.len() / logical_column_count)
+            (logical_column_count, metas.len() / logical_column_count)
         };
 
-    if directory.len() != logical_column_count * chunk_count {
+    if metas.len() != logical_column_count * chunk_count {
         return Err(ColumnarReadError::IncompleteChunkSet {
-            entries: directory.len(),
+            entries: metas.len(),
             logical_columns: logical_column_count,
         });
     }
 
-    for entry_index in 0..directory.len() {
+    for (entry_index, meta) in metas.iter().enumerate() {
         let expected_column_id = (entry_index % logical_column_count) as u32;
-        let got_column_id = directory.get(entry_index)?.column_id;
+        let got_column_id = meta.column_id;
         if got_column_id != expected_column_id {
             return Err(ColumnarReadError::InvalidChunkLayout {
                 entry_index,
@@ -847,10 +823,10 @@ fn usize_range(
 mod tests {
     use super::ColumnarReader;
     use crate::{
-        ColumnMeta, ColumnarReadError, ColumnarWriter, FileHeader, Int64Stats,
-        ValueAlignmentStrategy, FILE_HEADER_LEN, MIN_BUFFER_ALIGN, V0_PHYSICAL_FIXED_WIDTH_I64,
-        V0_PHYSICAL_UTF8_I32, VALUES_BUFFER_ALIGN,
+        ColumnMeta, ColumnarReadError, ColumnarWriter,
+        ColumnarType, FileHeader, Int64Stats, ValueAlignmentStrategy, VALUES_BUFFER_ALIGN, writer::ColumnarWriteError,
     };
+    use crate::MIN_BUFFER_ALIGN;
 
     fn encode_i64(values: &[i64]) -> Vec<u8> {
         values
@@ -875,20 +851,14 @@ mod tests {
         let (data_off, data_len) = w.write_fixed_width_values(&values, 8).unwrap();
         let meta = ColumnMeta {
             column_id: 0,
-            physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-            logical_type: 0,
+            column_type: ColumnarType::Int64,
             data_offset: data_off,
             data_length: data_len,
-            validity_offset: 0,
-            validity_length: 0,
-            offsets_offset: 0,
-            offsets_length: 0,
-            stats_offset: 0,
-            stats_length: 0,
+            ..Default::default()
         };
         w.patch_column_directory(std::slice::from_ref(&meta))
             .unwrap();
-        w.finalize_header().unwrap();
+        w.finalize_header_and_directory(1,1).unwrap();
         let file = w.into_inner();
 
         let r = ColumnarReader::new(&file).expect("parse");
@@ -935,60 +905,36 @@ mod tests {
         let metas = [
             ColumnMeta {
                 column_id: 0,
-                physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-                logical_type: 0,
+                column_type: ColumnarType::Int64,
                 data_offset: chunk0_col0_offset,
                 data_length: chunk0_col0_len,
-                validity_offset: 0,
-                validity_length: 0,
-                offsets_offset: 0,
-                offsets_length: 0,
-                stats_offset: 0,
-                stats_length: 0,
+                ..Default::default()
             },
             ColumnMeta {
                 column_id: 1,
-                physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-                logical_type: 0,
+                column_type: ColumnarType::Int64,
                 data_offset: chunk0_col1_offset,
                 data_length: chunk0_col1_len,
-                validity_offset: 0,
-                validity_length: 0,
-                offsets_offset: 0,
-                offsets_length: 0,
-                stats_offset: 0,
-                stats_length: 0,
+                ..Default::default()
             },
             ColumnMeta {
                 column_id: 0,
-                physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-                logical_type: 0,
+                column_type: ColumnarType::Int64,
                 data_offset: chunk1_col0_offset,
                 data_length: chunk1_col0_len,
-                validity_offset: 0,
-                validity_length: 0,
-                offsets_offset: 0,
-                offsets_length: 0,
-                stats_offset: 0,
-                stats_length: 0,
+                ..Default::default()
             },
             ColumnMeta {
                 column_id: 1,
-                physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-                logical_type: 0,
+                column_type: ColumnarType::Int64,
                 data_offset: chunk1_col1_offset,
                 data_length: chunk1_col1_len,
-                validity_offset: 0,
-                validity_length: 0,
-                offsets_offset: 0,
-                offsets_length: 0,
-                stats_offset: 0,
-                stats_length: 0,
+                ..Default::default()
             },
         ];
 
         w.patch_column_directory(&metas).unwrap();
-        w.finalize_header().unwrap();
+        w.finalize_header_and_directory(2,2).unwrap();
         let file = w.into_inner();
 
         let r = ColumnarReader::new(&file).unwrap();
@@ -1024,20 +970,16 @@ mod tests {
 
         let meta = ColumnMeta {
             column_id: 0,
-            physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-            logical_type: 0,
+            column_type: ColumnarType::Int64,
             data_offset,
             data_length,
-            validity_offset: 0,
-            validity_length: 0,
-            offsets_offset: 0,
-            offsets_length: 0,
             stats_offset,
             stats_length,
+            ..Default::default()
         };
         w.patch_column_directory(std::slice::from_ref(&meta))
             .unwrap();
-        w.finalize_header().unwrap();
+        w.finalize_header_and_directory(1,1).unwrap();
         let file = w.into_inner();
 
         let reader = ColumnarReader::new(&file).unwrap();
@@ -1066,20 +1008,16 @@ mod tests {
 
         let meta = ColumnMeta {
             column_id: 0,
-            physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-            logical_type: 0,
+            column_type: ColumnarType::Int64,
             data_offset,
             data_length,
-            validity_offset: 0,
-            validity_length: 0,
-            offsets_offset: 0,
-            offsets_length: 0,
             stats_offset,
             stats_length,
+            ..Default::default()
         };
         w.patch_column_directory(std::slice::from_ref(&meta))
             .unwrap();
-        w.finalize_header().unwrap();
+        w.finalize_header_and_directory(1,1).unwrap();
 
         let err = ColumnarReader::new(&w.into_inner()).unwrap_err();
         assert!(matches!(
@@ -1092,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_chunk_row_counts_are_rejected_by_reader() {
+    fn mismatched_chunk_row_counts_are_rejected_by_writer() {
         let schema = b"ipc-schema-bytes";
         let mut w = ColumnarWriter::new();
         w.write_header_placeholder().unwrap();
@@ -1107,38 +1045,24 @@ mod tests {
         let metas = [
             ColumnMeta {
                 column_id: 0,
-                physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-                logical_type: 0,
+                column_type: ColumnarType::Int64,
                 data_offset: col0_offset,
                 data_length: col0_len,
-                validity_offset: 0,
-                validity_length: 0,
-                offsets_offset: 0,
-                offsets_length: 0,
-                stats_offset: 0,
-                stats_length: 0,
+                ..Default::default()
             },
             ColumnMeta {
                 column_id: 1,
-                physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-                logical_type: 0,
+                column_type: ColumnarType::Int64,
                 data_offset: col1_offset,
                 data_length: col1_len,
-                validity_offset: 0,
-                validity_length: 0,
-                offsets_offset: 0,
-                offsets_length: 0,
-                stats_offset: 0,
-                stats_length: 0,
+                ..Default::default()
             },
         ];
-        w.patch_column_directory(&metas).unwrap();
-        w.finalize_header().unwrap();
+        let err = w.patch_column_directory(&metas).unwrap_err();
 
-        let err = ColumnarReader::new(&w.into_inner()).unwrap_err();
         assert!(matches!(
             err,
-            super::ColumnarReadError::ChunkRowCountMismatch {
+            ColumnarWriteError::ChunkRowCountMismatch {
                 chunk_index: 0,
                 expected_rows: 2,
                 column_index: 1,
@@ -1158,20 +1082,14 @@ mod tests {
         let (data_off, data_len) = w.write_values_buffer(&values, 8).unwrap();
         let meta = ColumnMeta {
             column_id: 0,
-            physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-            logical_type: 0,
+            column_type: ColumnarType::Int64,
             data_offset: data_off,
             data_length: data_len,
-            validity_offset: 0,
-            validity_length: 0,
-            offsets_offset: 0,
-            offsets_length: 0,
-            stats_offset: 0,
-            stats_length: 0,
+            ..Default::default()
         };
         w.patch_column_directory(std::slice::from_ref(&meta))
             .unwrap();
-        w.finalize_header().unwrap();
+        w.finalize_header_and_directory(1,1).unwrap();
         let file = w.into_inner();
 
         let reader = ColumnarReader::new(&file).unwrap();
@@ -1191,20 +1109,14 @@ mod tests {
         let (data_off, data_len) = w.write_values_buffer(&values, 8).unwrap();
         let meta = ColumnMeta {
             column_id: 0,
-            physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-            logical_type: 0,
+            column_type: ColumnarType::Int64,
             data_offset: data_off,
             data_length: data_len,
-            validity_offset: 0,
-            validity_length: 0,
-            offsets_offset: 0,
-            offsets_length: 0,
-            stats_offset: 0,
-            stats_length: 0,
+            ..Default::default()
         };
         w.patch_column_directory(std::slice::from_ref(&meta))
             .unwrap();
-        w.finalize_header().unwrap();
+        w.finalize_header_and_directory(1,1).unwrap();
         let file = w.into_inner();
 
         let reader = ColumnarReader::new(&file).unwrap();
@@ -1213,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn flagged_64_byte_values_alignment_rejects_misaligned_data() {
+    fn writer_rejects_misaligned_data_for_64_byte_alignment_flag() {
         let schema = b"ipc-schema-bytes";
         let mut w = ColumnarWriter::new().with_value_alignment(ValueAlignmentStrategy::Align64);
         w.write_header_placeholder().unwrap();
@@ -1225,32 +1137,29 @@ mod tests {
         assert_ne!(data_off % 64, 0);
         let meta = ColumnMeta {
             column_id: 0,
-            physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
-            logical_type: 0,
+            column_type: ColumnarType::Int64,
             data_offset: data_off,
             data_length: data_len,
-            validity_offset: 0,
-            validity_length: 0,
-            offsets_offset: 0,
-            offsets_length: 0,
-            stats_offset: 0,
-            stats_length: 0,
+            ..Default::default()
         };
-        let err = w
-            .patch_column_directory(std::slice::from_ref(&meta))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::ColumnarWriteError::MisalignedDataOffset {
-                required_alignment: 64,
-                ..
+        let err = w.patch_column_directory(std::slice::from_ref(&meta)).unwrap_err();
+        match err {
+            ColumnarWriteError::MisalignedDataOffset {
+                column_index,
+                offset,
+                required_alignment,
+            } => {
+                assert_eq!(column_index, 0);
+                assert_eq!(offset, data_off);
+                assert_eq!(required_alignment, 64);
             }
-        ));
+            e => panic!("unexpected error type: {:?}", e),
+        }
     }
 
     #[test]
     fn truncated_file_rejected() {
-        let mut file = vec![0u8; FILE_HEADER_LEN];
+        let mut file = vec![0u8; crate::FILE_HEADER_LEN];
         let hdr = FileHeader {
             magic: *b"COLUMNAR",
             version: 1,
@@ -1260,13 +1169,13 @@ mod tests {
             schema_length: 100,
             column_dir_offset: 200,
             column_dir_length: 80,
-            reserved: [0u8; 8],
+            ..Default::default()
         };
-        file[0..FILE_HEADER_LEN].copy_from_slice(&hdr.serialize());
+        file[0..crate::FILE_HEADER_LEN].copy_from_slice(&hdr.serialize());
         let err = ColumnarReader::new(&file).unwrap_err();
         match err {
-            super::ColumnarReadError::OutOfBounds { .. }
-            | super::ColumnarReadError::TooSmall { .. } => {}
+            super::ColumnarReadError::Columnar(..)
+            | super::ColumnarReadError::OutOfBounds { .. } => {}
             e => panic!("unexpected {e:?}"),
         }
     }
@@ -1305,8 +1214,7 @@ mod tests {
 
         let meta = ColumnMeta {
             column_id: 0,
-            physical_type: V0_PHYSICAL_UTF8_I32,
-            logical_type: 0,
+            column_type: ColumnarType::Utf8,
             data_offset,
             data_length,
             validity_offset,
@@ -1318,7 +1226,7 @@ mod tests {
         };
         w.patch_column_directory(std::slice::from_ref(&meta))
             .unwrap();
-        w.finalize_header().unwrap();
+        w.finalize_header_and_directory(1,1).unwrap();
         let file = w.into_inner();
 
         let reader = ColumnarReader::new(&file).unwrap();
@@ -1350,20 +1258,14 @@ mod tests {
 
         let meta = ColumnMeta {
             column_id: 0,
-            physical_type: V0_PHYSICAL_UTF8_I32,
-            logical_type: 0,
+            column_type: ColumnarType::Utf8,
             data_offset,
             data_length,
-            validity_offset: 0,
-            validity_length: 0,
-            offsets_offset: 0,
-            offsets_length: 0,
-            stats_offset: 0,
-            stats_length: 0,
+            ..Default::default()
         };
         w.patch_column_directory(std::slice::from_ref(&meta))
             .unwrap();
-        w.finalize_header().unwrap();
+        w.finalize_header_and_directory(1,1).unwrap();
         let file = w.into_inner();
 
         let err = ColumnarReader::new(&file)
