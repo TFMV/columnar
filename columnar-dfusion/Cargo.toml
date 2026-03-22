@@ -16,8 +16,13 @@ async-trait = "0.1.89"
 columnar-arrow = { path = "../columnar-arrow" }
 columnar-format = { path = "../columnar-format" }
 datafusion = "46.0.1"
+datafusion-common = "46.0.1"
 datafusion-datasource = "46.0.1"
+datafusion-execution = "46.0.1"
 datafusion-expr = "46.0.1"
+datafusion-physical-expr = "46.0.1"
+datafusion-physical-plan = "46.0.1"
+futures = "0.3.31"
 memmap2 = "0.9.10"
 
 [dev-dependencies]

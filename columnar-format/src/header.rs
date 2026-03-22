@@ -5,6 +5,8 @@ pub const FILE_HEADER_MAGIC: [u8; 8] = *b"COLUMNAR";
 
 /// Supported format version for this implementation.
 pub const FILE_HEADER_VERSION: u16 = 1;
+/// Header flag indicating all values buffers are 64-byte aligned.
+pub const FILE_FLAG_VALUES_ALIGNED_64: u16 = 1 << 0;
 
 /// Declared header size for v1 on disk (format §3).
 pub const FILE_HEADER_ON_DISK_SIZE: u32 = 64;
@@ -48,6 +50,8 @@ pub enum FileHeaderError {
     UnsupportedVersion { got: u16 },
     /// `header_size` must be [`FILE_HEADER_ON_DISK_SIZE`] for v1.
     InvalidHeaderSize { got: u32 },
+    /// Header uses bits not defined by this implementation.
+    InvalidFlags { got: u16 },
 }
 
 impl std::fmt::Display for FileHeaderError {
@@ -67,6 +71,9 @@ impl std::fmt::Display for FileHeaderError {
                 f,
                 "invalid header_size {got} (expected {FILE_HEADER_ON_DISK_SIZE} for v1)"
             ),
+            FileHeaderError::InvalidFlags { got } => {
+                write!(f, "invalid header flags {got:#06x}")
+            }
         }
     }
 }
@@ -87,7 +94,32 @@ impl FileHeader {
                 got: self.header_size,
             });
         }
+        if self.flags & !FILE_FLAG_VALUES_ALIGNED_64 != 0 {
+            return Err(FileHeaderError::InvalidFlags { got: self.flags });
+        }
         Ok(())
+    }
+
+    #[inline]
+    pub fn values_are_64_aligned(&self) -> bool {
+        self.flags & FILE_FLAG_VALUES_ALIGNED_64 != 0
+    }
+
+    #[inline]
+    pub fn logical_column_count(&self) -> u32 {
+        u32::from_le_bytes(self.reserved[..4].try_into().expect("reserved width"))
+    }
+
+    #[inline]
+    pub fn chunk_count(&self) -> u32 {
+        u32::from_le_bytes(self.reserved[4..8].try_into().expect("reserved width"))
+    }
+
+    #[inline]
+    pub fn with_chunk_layout(mut self, logical_column_count: u32, chunk_count: u32) -> Self {
+        self.reserved[..4].copy_from_slice(&logical_column_count.to_le_bytes());
+        self.reserved[4..8].copy_from_slice(&chunk_count.to_le_bytes());
+        self
     }
 
     /// Serializes the header to its on-disk little-endian form (64 bytes). No heap allocation.
@@ -140,8 +172,8 @@ fn read_fixed<const N: usize>(chunk: &[u8]) -> [u8; N] {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileHeader, FileHeaderError, FILE_HEADER_LEN, FILE_HEADER_MAGIC, FILE_HEADER_ON_DISK_SIZE,
-        FILE_HEADER_VERSION,
+        FileHeader, FileHeaderError, FILE_FLAG_VALUES_ALIGNED_64, FILE_HEADER_LEN,
+        FILE_HEADER_MAGIC, FILE_HEADER_ON_DISK_SIZE, FILE_HEADER_VERSION,
     };
 
     fn sample_header() -> FileHeader {
@@ -226,5 +258,13 @@ mod tests {
         bytes[56..64].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let got = FileHeader::deserialize(&bytes).expect("ok");
         assert_eq!(got, sample_header());
+    }
+
+    #[test]
+    fn values_alignment_flag_round_trip() {
+        let mut h = sample_header();
+        h.flags = FILE_FLAG_VALUES_ALIGNED_64;
+        let got = FileHeader::deserialize(&h.serialize()).expect("deserialize");
+        assert!(got.values_are_64_aligned());
     }
 }
