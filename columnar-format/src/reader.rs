@@ -81,7 +81,10 @@ impl fmt::Display for ColumnarReadError {
             ColumnarReadError::Directory(e) => write!(f, "directory: {e}"),
             ColumnarReadError::RangeOverflow => write!(f, "offset/length overflow"),
             ColumnarReadError::FileTooLargeForPlatform => {
-                write!(f, "file size does not fit in address space on this platform")
+                write!(
+                    f,
+                    "file size does not fit in address space on this platform"
+                )
             }
             ColumnarReadError::OutOfBounds {
                 offset,
@@ -92,15 +95,20 @@ impl fmt::Display for ColumnarReadError {
                 "range [{offset}, {}) exceeds file length {file_len}",
                 offset.saturating_add(*length)
             ),
-            ColumnarReadError::SchemaOffsetTooSmall { offset, min } => write!(
-                f,
-                "schema_offset {offset} is before end of header ({min})"
-            ),
+            ColumnarReadError::SchemaOffsetTooSmall { offset, min } => {
+                write!(f, "schema_offset {offset} is before end of header ({min})")
+            }
             ColumnarReadError::SchemaStartNotAligned { offset } => {
-                write!(f, "schema_offset {offset} is not aligned to {MIN_BUFFER_ALIGN}")
+                write!(
+                    f,
+                    "schema_offset {offset} is not aligned to {MIN_BUFFER_ALIGN}"
+                )
             }
             ColumnarReadError::DirectoryStartNotAligned { offset } => {
-                write!(f, "column_dir_offset {offset} is not aligned to {MIN_BUFFER_ALIGN}")
+                write!(
+                    f,
+                    "column_dir_offset {offset} is not aligned to {MIN_BUFFER_ALIGN}"
+                )
             }
             ColumnarReadError::SectionOrdering { msg } => write!(f, "{msg}"),
             ColumnarReadError::UnalignedBuffer {
@@ -158,7 +166,8 @@ impl<'a> ColumnarReader<'a> {
         let header = FileHeader::deserialize(&bytes[..FILE_HEADER_LEN])?;
         header.validate()?;
 
-        let file_len = u64::try_from(bytes.len()).map_err(|_| ColumnarReadError::FileTooLargeForPlatform)?;
+        let file_len =
+            u64::try_from(bytes.len()).map_err(|_| ColumnarReadError::FileTooLargeForPlatform)?;
 
         let (schema_start, schema_end) =
             u64_range_to_usize(header.schema_offset, header.schema_length, file_len)?;
@@ -175,11 +184,8 @@ impl<'a> ColumnarReader<'a> {
             });
         }
 
-        let (dir_start, dir_end) = u64_range_to_usize(
-            header.column_dir_offset,
-            header.column_dir_length,
-            file_len,
-        )?;
+        let (dir_start, dir_end) =
+            u64_range_to_usize(header.column_dir_offset, header.column_dir_length, file_len)?;
 
         if header.column_dir_offset % MIN_BUFFER_ALIGN != 0 {
             return Err(ColumnarReadError::DirectoryStartNotAligned {
@@ -257,12 +263,22 @@ impl<'a> ColumnarReader<'a> {
 
     pub fn column_validity(&self, index: usize) -> Result<Option<&'a [u8]>, ColumnarReadError> {
         let m = self.column_meta(index)?;
-        self.optional_slice_buffer(index, BufferField::Validity, m.validity_offset, m.validity_length)
+        self.optional_slice_buffer(
+            index,
+            BufferField::Validity,
+            m.validity_offset,
+            m.validity_length,
+        )
     }
 
     pub fn column_offsets(&self, index: usize) -> Result<Option<&'a [u8]>, ColumnarReadError> {
         let m = self.column_meta(index)?;
-        self.optional_slice_buffer(index, BufferField::Offsets, m.offsets_offset, m.offsets_length)
+        self.optional_slice_buffer(
+            index,
+            BufferField::Offsets,
+            m.offsets_offset,
+            m.offsets_length,
+        )
     }
 
     pub fn column_stats(&self, index: usize) -> Result<Option<&'a [u8]>, ColumnarReadError> {
@@ -270,7 +286,10 @@ impl<'a> ColumnarReader<'a> {
         self.optional_slice_buffer(index, BufferField::Stats, m.stats_offset, m.stats_length)
     }
 
-    pub fn column_buffers(&self, index: usize) -> Result<ColumnBufferSlices<'a>, ColumnarReadError> {
+    pub fn column_buffers(
+        &self,
+        index: usize,
+    ) -> Result<ColumnBufferSlices<'a>, ColumnarReadError> {
         Ok(ColumnBufferSlices {
             values: self.column_values(index)?,
             validity: self.column_validity(index)?,
@@ -303,11 +322,7 @@ impl<'a> ColumnarReader<'a> {
         let dir0 = self.header.column_dir_offset;
         let dir1 = dir0.saturating_add(self.header.column_dir_length);
 
-        let structural = [
-            (0u64, hdr_end),
-            (schema0, schema1),
-            (dir0, dir1),
-        ];
+        let structural = [(0u64, hdr_end), (schema0, schema1), (dir0, dir1)];
 
         for i in 0..self.directory.len() {
             let m = self.directory.get(i)?;
@@ -320,7 +335,9 @@ impl<'a> ColumnarReader<'a> {
                 if len == 0 {
                     continue;
                 }
-                let end = off.checked_add(len).ok_or(ColumnarReadError::RangeOverflow)?;
+                let end = off
+                    .checked_add(len)
+                    .ok_or(ColumnarReadError::RangeOverflow)?;
                 if end > file_len {
                     return Err(ColumnarReadError::OutOfBounds {
                         offset: off,
@@ -381,7 +398,12 @@ impl<'a> ColumnarReader<'a> {
         if length == 0 {
             return Ok(None);
         }
-        Ok(Some(self.slice_buffer(column_index, field, offset, length)?))
+        Ok(Some(self.slice_buffer(
+            column_index,
+            field,
+            offset,
+            length,
+        )?))
     }
 }
 
@@ -414,7 +436,8 @@ fn usize_range(
     length: u64,
     file_len: usize,
 ) -> Result<(usize, usize), ColumnarReadError> {
-    let file_len_u64 = u64::try_from(file_len).map_err(|_| ColumnarReadError::FileTooLargeForPlatform)?;
+    let file_len_u64 =
+        u64::try_from(file_len).map_err(|_| ColumnarReadError::FileTooLargeForPlatform)?;
     let (start, end) = u64_range_to_usize(offset, length, file_len_u64)?;
     Ok((start, end))
 }
@@ -450,14 +473,18 @@ mod tests {
             stats_offset: 0,
             stats_length: 0,
         };
-        w.patch_column_directory(std::slice::from_ref(&meta)).unwrap();
+        w.patch_column_directory(std::slice::from_ref(&meta))
+            .unwrap();
         w.finalize_header().unwrap();
         let file = w.into_inner();
 
         let r = ColumnarReader::new(&file).expect("parse");
         assert_eq!(r.header().magic, *b"COLUMNAR");
         assert_eq!(r.schema_bytes(), schema);
-        assert_eq!(r.schema_bytes().as_ptr(), file[r.header().schema_offset as usize..].as_ptr());
+        assert_eq!(
+            r.schema_bytes().as_ptr(),
+            file[r.header().schema_offset as usize..].as_ptr()
+        );
         assert_eq!(r.column_count(), 1);
         assert_eq!(r.column_values(0).unwrap(), values.as_slice());
         assert_eq!(

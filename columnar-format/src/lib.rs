@@ -17,6 +17,6 @@ pub use header::{
 };
 pub use reader::{ColumnBufferSlices, ColumnarReadError, ColumnarReader};
 pub use writer::{
-    ColumnarWriteError, ColumnarWriter, SECTION_ALIGN, VALUES_BUFFER_ALIGN,
-    V0_PHYSICAL_FIXED_WIDTH_I64,
+    ColumnarWriteError, ColumnarWriter, SECTION_ALIGN, V0_PHYSICAL_FIXED_WIDTH_I64,
+    VALUES_BUFFER_ALIGN,
 };

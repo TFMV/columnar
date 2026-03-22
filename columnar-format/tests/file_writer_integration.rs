@@ -2,8 +2,8 @@
 
 use columnar_format::{
     pad_length, ColumnDirectory, ColumnDirectoryView, ColumnMeta, ColumnarWriter, FileHeader,
-    FILE_HEADER_LEN, COLUMN_META_LEN, SECTION_ALIGN, VALUES_BUFFER_ALIGN,
-    V0_PHYSICAL_FIXED_WIDTH_I64,
+    COLUMN_META_LEN, FILE_HEADER_LEN, SECTION_ALIGN, V0_PHYSICAL_FIXED_WIDTH_I64,
+    VALUES_BUFFER_ALIGN,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -11,10 +11,7 @@ use std::path::PathBuf;
 #[test]
 fn write_file_read_raw_bytes_verify_layout() {
     let tmp = std::env::temp_dir();
-    let path: PathBuf = tmp.join(format!(
-        "columnar_test_{}.columnar",
-        std::process::id()
-    ));
+    let path: PathBuf = tmp.join(format!("columnar_test_{}.columnar", std::process::id()));
 
     let schema = b"arrow-ipc-schema-placeholder";
 
@@ -24,9 +21,7 @@ fn write_file_read_raw_bytes_verify_layout() {
     let dir_offset = w.reserve_column_directory(1).unwrap();
     w.pad_to_alignment(VALUES_BUFFER_ALIGN).unwrap();
 
-    let values: Vec<u8> = (0i64..5)
-        .flat_map(|v| v.to_le_bytes())
-        .collect();
+    let values: Vec<u8> = (0i64..5).flat_map(|v| v.to_le_bytes()).collect();
     let (data_off, data_len) = w.write_fixed_width_values(&values, 8).unwrap();
 
     let meta = ColumnMeta {
@@ -42,7 +37,8 @@ fn write_file_read_raw_bytes_verify_layout() {
         stats_offset: 0,
         stats_length: 0,
     };
-    w.patch_column_directory(std::slice::from_ref(&meta)).unwrap();
+    w.patch_column_directory(std::slice::from_ref(&meta))
+        .unwrap();
     w.finalize_header().unwrap();
     let bytes = w.into_inner();
 

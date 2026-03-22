@@ -67,10 +67,8 @@ mod tests {
 
     #[test]
     fn invalid_path_not_found() {
-        let path = std::env::temp_dir().join(format!(
-            "__columnar_mmap_missing__.{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("__columnar_mmap_missing__.{}", std::process::id()));
         match MmapFile::open(&path) {
             Err(e) => assert_eq!(e.kind(), ErrorKind::NotFound),
             Ok(_) => panic!("expected open to fail"),
@@ -79,8 +77,7 @@ mod tests {
 
     #[test]
     fn empty_file_yields_empty_slice() {
-        let path =
-            std::env::temp_dir().join(format!("columnar_mmap_empty_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("columnar_mmap_empty_{}", std::process::id()));
         std::fs::File::create(&path).unwrap();
         let map = MmapFile::open(&path).expect("open empty");
         assert!(map.as_slice().is_empty());
