@@ -3,6 +3,6 @@
 mod int64;
 
 pub use int64::{
-    ArrowBuildError, build_int64_array_data_from_mmap, build_int64_array_from_mmap,
+    ArrowBuildError, MmapBuffer, build_int64_array_data_from_mmap, build_int64_array_from_mmap,
     int64_array_data_from_slices,
 };

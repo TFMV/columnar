@@ -3,7 +3,6 @@ use std::sync::Arc;
 use arrow_array::Int64Array;
 use arrow_buffer::alloc::Allocation as ArrowAllocation;
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
-use bytes::Bytes;
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType};
 use memmap2::Mmap;
@@ -68,6 +67,16 @@ impl std::fmt::Display for ArrowBuildError {
 
 impl std::error::Error for ArrowBuildError {}
 
+/// Zero-copy buffer view backed by a retained `Arc<Mmap>`.
+///
+/// This type is the only way mmap-backed slices are converted into Arrow `Buffer`s in this crate.
+#[derive(Clone)]
+pub struct MmapBuffer {
+    arc: Arc<Mmap>,
+    ptr: *const u8,
+    len: usize,
+}
+
 #[derive(Clone)]
 struct MmapOwner {
     _mmap: Arc<Mmap>,
@@ -110,26 +119,52 @@ fn slice_within_mmap(mmap: &Mmap, slice: &[u8]) -> Result<(), ArrowBuildError> {
     Ok(())
 }
 
-/// Safety: `ptr..ptr+len` must point into the live mmap region, and the returned `Buffer` keeps
-/// the mmap alive by storing an internal `Arc<Mmap>` in `owner`.
-unsafe fn buffer_from_mmap_slice(
-    mmap: Arc<Mmap>,
-    slice: &[u8],
-) -> Result<Buffer, ArrowBuildError> {
-    if slice.is_empty() {
-        return Ok(Buffer::from(Bytes::new()));
+impl MmapBuffer {
+    /// Create a zero-copy mmap-backed buffer view for `slice`.
+    pub fn try_new(arc: Arc<Mmap>, slice: &[u8]) -> Result<Self, ArrowBuildError> {
+        slice_within_mmap(&arc, slice)?;
+        let ptr = if slice.is_empty() {
+            // Zero-length buffers never dereference their pointer. Use the mmap base when
+            // available, and a dangling non-null pointer for empty mmaps so Arrow still gets a
+            // valid non-null raw pointer representation without allocating.
+            if arc.is_empty() {
+                std::ptr::NonNull::<u8>::dangling().as_ptr()
+            } else {
+                arc.as_ref().as_ptr()
+            }
+        } else {
+            slice.as_ptr()
+        };
+
+        Ok(Self {
+            arc,
+            ptr,
+            len: slice.len(),
+        })
     }
 
-    let ptr = std::ptr::NonNull::new(slice.as_ptr() as *mut u8).ok_or(
-        ArrowBuildError::SliceNotWithinMmap {
-            slice_ptr: slice.as_ptr() as usize,
-            slice_len: slice.len(),
-            mmap_len: mmap.len(),
-        },
-    )?;
-    let len = slice.len();
-    let owner: Arc<dyn ArrowAllocation> = Arc::new(MmapOwner { _mmap: mmap });
-    Ok(Buffer::from_custom_allocation(ptr, len, owner))
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Convert this mmap-backed view into an Arrow `Buffer` without copying.
+    fn into_arrow_buffer(self) -> Buffer {
+        let owner: Arc<dyn ArrowAllocation> = Arc::new(MmapOwner { _mmap: self.arc });
+        let ptr = std::ptr::NonNull::new(self.ptr as *mut u8)
+            .unwrap_or_else(std::ptr::NonNull::dangling);
+
+        // SAFETY:
+        // - `ptr` is non-null. For `len > 0`, it comes from a slice already validated to lie
+        //   wholly within the live mmap region.
+        // - Bounds were checked in `MmapBuffer::try_new`, so `ptr..ptr+len` is valid for reads.
+        // - Alignment is validated by the typed constructors before this method is called.
+        // - The returned `Buffer` co-owns the underlying mapping through `owner`, which holds an
+        //   `Arc<Mmap>`, so the backing memory outlives all Arrow buffer clones and slices.
+        // - For `len == 0`, Arrow never dereferences the pointer; a dangling non-null pointer is
+        //   therefore valid and avoids allocating an empty owned buffer.
+        unsafe { Buffer::from_custom_allocation(ptr, self.len, owner) }
+    }
 }
 
 fn make_values_buffer(
@@ -145,9 +180,7 @@ fn make_values_buffer(
     if ptr % alignment != 0 {
         return Err(ArrowBuildError::ValuesMisaligned { ptr, alignment });
     }
-    slice_within_mmap(&mmap, values)?;
-    // SAFETY: checks above ensure `values` points into `mmap` and is aligned for `i64`.
-    let buf = unsafe { buffer_from_mmap_slice(mmap, values)? };
+    let buf = MmapBuffer::try_new(mmap, values)?.into_arrow_buffer();
     Ok((buf, len))
 }
 
@@ -177,10 +210,7 @@ fn make_nulls(
             alignment,
         });
     }
-    slice_within_mmap(&mmap, validity)?;
-
-    // SAFETY: `validity` points into mmap, and `NullBuffer` consumes it as a packed bitmask.
-    let validity_buffer = unsafe { buffer_from_mmap_slice(mmap, validity)? };
+    let validity_buffer = MmapBuffer::try_new(mmap, validity)?.into_arrow_buffer();
     let boolean_buffer = BooleanBuffer::new(validity_buffer, 0, len);
     Ok(Some(NullBuffer::new(boolean_buffer)))
 }
