@@ -6,11 +6,12 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use columnar_arrow::build_int64_array;
-use columnar_arrow::buffer::ArrowBuildError;
-use columnar_format::{ColumnarReadError, ColumnarReader, Int64Stats, V0_PHYSICAL_FIXED_WIDTH_I64};
+use columnar_arrow::build_array;
+use columnar_format::{
+    ColumnarReadError, ColumnarReader, ColumnarType, Int64Stats, UnsupportedArrowType,
+};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, ScalarValue};
 use datafusion::datasource::TableProvider;
@@ -56,11 +57,7 @@ impl ReadMetrics {
 #[derive(Debug)]
 pub enum ColumnarTableProviderError {
     Read(ColumnarReadError),
-    Arrow(ArrowBuildError),
-    UnsupportedPhysicalType {
-        column_index: usize,
-        physical_type: u32,
-    },
+    UnsupportedArrowType(UnsupportedArrowType),
     SchemaColumnCountMismatch {
         schema_fields: usize,
         file_columns: usize,
@@ -73,14 +70,7 @@ impl std::fmt::Display for ColumnarTableProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Read(err) => write!(f, "reader error: {err}"),
-            Self::Arrow(err) => write!(f, "arrow build error: {err}"),
-            Self::UnsupportedPhysicalType {
-                column_index,
-                physical_type,
-            } => write!(
-                f,
-                "column {column_index} uses unsupported physical type {physical_type}"
-            ),
+            Self::UnsupportedArrowType(err) => write!(f, "unsupported type: {err}"),
             Self::SchemaColumnCountMismatch {
                 schema_fields,
                 file_columns,
@@ -104,9 +94,9 @@ impl From<ColumnarReadError> for ColumnarTableProviderError {
     }
 }
 
-impl From<ArrowBuildError> for ColumnarTableProviderError {
-    fn from(value: ArrowBuildError) -> Self {
-        Self::Arrow(value)
+impl From<UnsupportedArrowType> for ColumnarTableProviderError {
+    fn from(value: UnsupportedArrowType) -> Self {
+        Self::UnsupportedArrowType(value)
     }
 }
 
@@ -171,17 +161,10 @@ impl ColumnarTableProvider {
             });
         }
 
-        for chunk_index in 0..reader.chunk_count() {
-            for index in 0..reader.column_count() {
-                let meta = reader.chunk_column_meta(chunk_index, index)?;
-                if meta.physical_type != V0_PHYSICAL_FIXED_WIDTH_I64 {
-                    return Err(ColumnarTableProviderError::UnsupportedPhysicalType {
-                        column_index: index,
-                        physical_type: meta.physical_type,
-                    });
-                }
-                let _ = reader.chunk_column_int64_stats(chunk_index, index)?;
-            }
+        // Validate that all columns in the file have a type mapping supported by this provider.
+        for index in 0..reader.column_count() {
+            let meta = reader.chunk_column_meta(0, index)?;
+            let _ = ColumnarType::try_from(meta.column_type)?;
         }
 
         Ok(Self {
@@ -249,14 +232,25 @@ impl ColumnarDataSource {
             self.metrics
                 .data_buffers_read
                 .fetch_add(1, Ordering::Relaxed);
-            let values = reader.chunk_column_values(chunk_index, index)?;
-            let validity = reader.chunk_column_validity(chunk_index, index)?;
-            let array = build_int64_array(self.mmap.clone(), values, validity)?;
-            columns.push(Arc::new(array) as ArrayRef);
+
+            let meta = reader.chunk_column_meta(chunk_index, index)?;
+            let s = reader.column_buffers(chunk_index, index)?;
+
+            let array = build_array(
+                self.mmap.clone(),
+                meta.column_type,
+                s.rows,
+                s.values,
+                s.validity,
+                s.offsets,
+            )?;
+            columns.push(array);
         }
 
-        if columns.is_empty() {
-            return RecordBatch::try_new(projected_schema, Vec::new()).map_err(Into::into);
+        if columns.is_empty() && self.exact_row_count() > 0 {
+            // No columns are projected, but there are rows. Return a batch with the correct row count.
+            let row_count = self.chunk_row_counts[chunk_index];
+            return RecordBatch::try_new(projected_schema, vec![]).map_err(Into::into).and_then(|batch| Ok(batch.slice(0, row_count.min(batch.num_rows()))));
         }
 
         RecordBatch::try_new(projected_schema, columns).map_err(Into::into)
@@ -693,7 +687,7 @@ fn reverse_operator(op: Operator) -> Operator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, Int64Array};
+    use arrow_array::{Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use columnar_format::{ColumnarWriter, Int64Stats};
     use columnar_mmap::MmapFile;
@@ -779,7 +773,6 @@ mod tests {
                     writer
                         .write_int64_column_chunk(
                             index as u32,
-                            0,
                             &encoded,
                             validity_bytes.as_deref(),
                             Some(stats_for(values, null_count)),
