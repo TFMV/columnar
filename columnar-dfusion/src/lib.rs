@@ -9,12 +9,12 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use columnar_arrow::{build_int64_array_from_mmap, ArrowBuildError};
-use columnar_format::{ColumnarReadError, ColumnarReader, V0_PHYSICAL_FIXED_WIDTH_I64};
+use columnar_format::{ColumnarReadError, ColumnarReader, Int64Stats, V0_PHYSICAL_FIXED_WIDTH_I64};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, ScalarValue};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{Expr, Operator, TableType};
-use datafusion_common::stats::Precision;
+use datafusion_common::stats::{ColumnStatistics, Precision};
 use datafusion_common::Statistics;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -25,13 +25,6 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, ExecutionPlan};
 use futures::stream;
 use memmap2::Mmap;
-
-/// Fixed-width `i64` stats stored as little-endian `(min, max)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Int64ChunkStats {
-    pub min: i64,
-    pub max: i64,
-}
 
 /// Read counters used by tests to verify chunk pruning.
 #[derive(Debug, Default)]
@@ -71,10 +64,7 @@ pub enum ColumnarTableProviderError {
         schema_fields: usize,
         file_columns: usize,
     },
-    InvalidStatsLength {
-        column_index: usize,
-        got: usize,
-    },
+    StatisticsOverflow(&'static str),
     RecordBatch(arrow_schema::ArrowError),
 }
 
@@ -97,10 +87,9 @@ impl std::fmt::Display for ColumnarTableProviderError {
                 f,
                 "schema has {schema_fields} fields but file exposes {file_columns} columns"
             ),
-            Self::InvalidStatsLength { column_index, got } => write!(
-                f,
-                "column {column_index} stats length {got} is not 16 bytes"
-            ),
+            Self::StatisticsOverflow(context) => {
+                write!(f, "statistics overflow while computing {context}")
+            }
             Self::RecordBatch(err) => write!(f, "record batch error: {err}"),
         }
     }
@@ -132,44 +121,19 @@ impl From<ColumnarTableProviderError> for DataFusionError {
     }
 }
 
-impl Int64ChunkStats {
-    pub const SERIALIZED_LEN: usize = 16;
+fn int64_stats_may_satisfy(stats: Int64Stats, op: Operator, literal: i64) -> bool {
+    let (Some(min), Some(max)) = (stats.min, stats.max) else {
+        return true;
+    };
 
-    #[inline]
-    pub fn serialize(self) -> [u8; Self::SERIALIZED_LEN] {
-        let mut out = [0u8; Self::SERIALIZED_LEN];
-        out[..8].copy_from_slice(&self.min.to_le_bytes());
-        out[8..16].copy_from_slice(&self.max.to_le_bytes());
-        out
-    }
-
-    fn try_from_slice(
-        column_index: usize,
-        bytes: &[u8],
-    ) -> Result<Self, ColumnarTableProviderError> {
-        if bytes.len() != Self::SERIALIZED_LEN {
-            return Err(ColumnarTableProviderError::InvalidStatsLength {
-                column_index,
-                got: bytes.len(),
-            });
-        }
-
-        Ok(Self {
-            min: i64::from_le_bytes(bytes[..8].try_into().expect("validated stats length")),
-            max: i64::from_le_bytes(bytes[8..16].try_into().expect("validated stats length")),
-        })
-    }
-
-    fn may_satisfy(self, op: Operator, literal: i64) -> bool {
-        match op {
-            Operator::Eq => self.min <= literal && literal <= self.max,
-            Operator::NotEq => !(self.min == literal && self.max == literal),
-            Operator::Lt => self.min < literal,
-            Operator::LtEq => self.min <= literal,
-            Operator::Gt => self.max > literal,
-            Operator::GtEq => self.max >= literal,
-            _ => true,
-        }
+    match op {
+        Operator::Eq => min <= literal && literal <= max,
+        Operator::NotEq => !(min == literal && max == literal),
+        Operator::Lt => min < literal,
+        Operator::LtEq => min <= literal,
+        Operator::Gt => max > literal,
+        Operator::GtEq => max >= literal,
+        _ => true,
     }
 }
 
@@ -188,6 +152,7 @@ struct ColumnarDataSource {
     projection: Option<Vec<usize>>,
     included_chunks: Vec<usize>,
     chunk_row_counts: Vec<usize>,
+    statistics: Statistics,
     metrics: Arc<ReadMetrics>,
     fetch: Option<usize>,
 }
@@ -214,9 +179,7 @@ impl ColumnarTableProvider {
                         physical_type: meta.physical_type,
                     });
                 }
-                if let Some(stats) = reader.chunk_column_stats(chunk_index, index)? {
-                    let _ = Int64ChunkStats::try_from_slice(index, stats)?;
-                }
+                let _ = reader.chunk_column_int64_stats(chunk_index, index)?;
             }
         }
 
@@ -365,10 +328,9 @@ impl DataSource for ColumnarDataSource {
     }
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
-            num_rows: Precision::Exact(self.exact_row_count()),
-            ..Statistics::new_unknown(&self.projected_schema())
-        })
+        let mut statistics = self.statistics.clone();
+        statistics.num_rows = Precision::Exact(self.exact_row_count());
+        Ok(statistics)
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -441,6 +403,8 @@ impl TableProvider for ColumnarTableProvider {
                     .map_err(ColumnarTableProviderError::from)?,
             );
         }
+        let statistics =
+            build_scan_statistics(&reader, self.schema.as_ref(), projection, &included_chunks)?;
 
         let source = ColumnarDataSource {
             mmap: self.mmap.clone(),
@@ -448,6 +412,7 @@ impl TableProvider for ColumnarTableProvider {
             projection: projection.cloned(),
             included_chunks,
             chunk_row_counts,
+            statistics,
             metrics: self.metrics.clone(),
             fetch: limit,
         };
@@ -470,6 +435,115 @@ fn projected_schema(schema: SchemaRef, projection: &[usize]) -> SchemaRef {
             .project(projection)
             .expect("projection indices are validated by DataFusion"),
     )
+}
+
+fn build_scan_statistics(
+    reader: &ColumnarReader<'_>,
+    schema: &arrow_schema::Schema,
+    projection: Option<&Vec<usize>>,
+    included_chunks: &[usize],
+) -> Result<Statistics, ColumnarTableProviderError> {
+    let projected_indices = projection_indices(schema, projection);
+    let projected_schema = Arc::new(
+        schema
+            .project(&projected_indices)
+            .expect("projection indices are validated by DataFusion"),
+    );
+    let mut num_rows = 0usize;
+    let mut total_byte_size = 0usize;
+    let mut column_statistics = Vec::with_capacity(projected_indices.len());
+
+    for &chunk_index in included_chunks {
+        num_rows = num_rows
+            .checked_add(reader.chunk_row_count(chunk_index)?)
+            .ok_or(ColumnarTableProviderError::StatisticsOverflow("row count"))?;
+    }
+
+    for &column_index in &projected_indices {
+        let mut min_value: Option<i64> = None;
+        let mut max_value: Option<i64> = None;
+        let mut min_max_complete = true;
+        let mut null_count = 0usize;
+        let mut null_count_complete = true;
+        let mut distinct_sum = 0usize;
+        let mut distinct_complete = true;
+
+        for &chunk_index in included_chunks {
+            let meta = reader.chunk_column_meta(chunk_index, column_index)?;
+            total_byte_size = total_byte_size
+                .checked_add(meta.data_length as usize)
+                .and_then(|value| value.checked_add(meta.validity_length as usize))
+                .and_then(|value| value.checked_add(meta.offsets_length as usize))
+                .ok_or(ColumnarTableProviderError::StatisticsOverflow(
+                    "projected byte size",
+                ))?;
+
+            let Some(stats) = reader.chunk_column_int64_stats(chunk_index, column_index)? else {
+                min_max_complete = false;
+                null_count_complete = false;
+                distinct_complete = false;
+                continue;
+            };
+
+            match (stats.min, stats.max) {
+                (Some(chunk_min), Some(chunk_max)) => {
+                    min_value = Some(min_value.map_or(chunk_min, |value| value.min(chunk_min)));
+                    max_value = Some(max_value.map_or(chunk_max, |value| value.max(chunk_max)));
+                }
+                _ => min_max_complete = false,
+            }
+
+            null_count = null_count
+                .checked_add(stats.null_count as usize)
+                .ok_or(ColumnarTableProviderError::StatisticsOverflow("null count"))?;
+
+            let Some(distinct_count) = stats.distinct_count else {
+                distinct_complete = false;
+                continue;
+            };
+            distinct_sum = distinct_sum.checked_add(distinct_count as usize).ok_or(
+                ColumnarTableProviderError::StatisticsOverflow("distinct count"),
+            )?;
+        }
+
+        column_statistics.push(ColumnStatistics {
+            null_count: if null_count_complete {
+                Precision::Exact(null_count)
+            } else {
+                Precision::Absent
+            },
+            max_value: if min_max_complete {
+                max_value
+                    .map(|value| Precision::Exact(ScalarValue::Int64(Some(value))))
+                    .unwrap_or(Precision::Absent)
+            } else {
+                Precision::Absent
+            },
+            min_value: if min_max_complete {
+                min_value
+                    .map(|value| Precision::Exact(ScalarValue::Int64(Some(value))))
+                    .unwrap_or(Precision::Absent)
+            } else {
+                Precision::Absent
+            },
+            sum_value: Precision::Absent,
+            distinct_count: if distinct_complete {
+                Precision::Inexact(distinct_sum)
+            } else {
+                Precision::Absent
+            },
+        });
+    }
+
+    Ok(Statistics {
+        num_rows: Precision::Exact(num_rows),
+        total_byte_size: Precision::Exact(total_byte_size),
+        column_statistics: if projected_indices.is_empty() {
+            Statistics::unknown_column(&projected_schema)
+        } else {
+            column_statistics
+        },
+    })
 }
 
 fn can_prune_with_stats(expr: &Expr) -> bool {
@@ -496,7 +570,7 @@ fn expr_proves_chunk_empty(
     reader: &ColumnarReader<'_>,
     chunk_index: usize,
     metrics: &ReadMetrics,
-    stats_cache: &mut HashMap<(usize, usize), Option<Int64ChunkStats>>,
+    stats_cache: &mut HashMap<(usize, usize), Option<Int64Stats>>,
 ) -> Result<bool, ColumnarTableProviderError> {
     match expr {
         Expr::BinaryExpr(binary) => match binary.op {
@@ -547,7 +621,7 @@ fn expr_proves_chunk_empty(
                 else {
                     return Ok(false);
                 };
-                Ok(!stats.may_satisfy(op, literal))
+                Ok(!int64_stats_may_satisfy(stats, op, literal))
             }
             _ => Ok(false),
         },
@@ -560,17 +634,14 @@ fn load_stats(
     column_index: usize,
     reader: &ColumnarReader<'_>,
     metrics: &ReadMetrics,
-    stats_cache: &mut HashMap<(usize, usize), Option<Int64ChunkStats>>,
-) -> Result<Option<Int64ChunkStats>, ColumnarTableProviderError> {
+    stats_cache: &mut HashMap<(usize, usize), Option<Int64Stats>>,
+) -> Result<Option<Int64Stats>, ColumnarTableProviderError> {
     let cache_key = (chunk_index, column_index);
     if let Some(stats) = stats_cache.get(&cache_key) {
         return Ok(*stats);
     }
 
-    let stats = reader
-        .chunk_column_stats(chunk_index, column_index)?
-        .map(|bytes| Int64ChunkStats::try_from_slice(column_index, bytes))
-        .transpose()?;
+    let stats = reader.chunk_column_int64_stats(chunk_index, column_index)?;
     if stats.is_some() {
         metrics.stats_buffers_read.fetch_add(1, Ordering::Relaxed);
     }
@@ -623,9 +694,12 @@ mod tests {
     use super::*;
     use arrow_array::{Array, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use columnar_format::{ColumnMeta, ColumnarWriter, MIN_BUFFER_ALIGN, VALUES_BUFFER_ALIGN};
+    use columnar_format::{
+        ColumnMeta, ColumnarWriter, Int64Stats, MIN_BUFFER_ALIGN, VALUES_BUFFER_ALIGN,
+    };
     use columnar_mmap::MmapFile;
     use datafusion::prelude::SessionContext;
+    use datafusion_common::stats::Precision;
     use tempfile::NamedTempFile;
 
     fn encode_i64(values: &[i64]) -> Vec<u8> {
@@ -635,10 +709,18 @@ mod tests {
             .collect()
     }
 
-    fn stats_bytes(values: &[i64]) -> [u8; Int64ChunkStats::SERIALIZED_LEN] {
-        let stats = Int64ChunkStats {
-            min: *values.iter().min().expect("non-empty values"),
-            max: *values.iter().max().expect("non-empty values"),
+    fn stats_bytes(values: &[i64]) -> [u8; Int64Stats::SERIALIZED_LEN] {
+        let stats = Int64Stats {
+            min: values.iter().min().copied(),
+            max: values.iter().max().copied(),
+            null_count: 0,
+            distinct_count: Some(
+                values
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len() as u64,
+            ),
         };
         stats.serialize()
     }
@@ -729,10 +811,30 @@ mod tests {
             .expect("collect query")
     }
 
+    async fn scan_statistics(
+        provider: &ColumnarTableProvider,
+        projection: Option<Vec<usize>>,
+        filters: Vec<Expr>,
+    ) -> Statistics {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        provider
+            .scan(&state, projection.as_ref(), &filters, None)
+            .await
+            .expect("scan plan")
+            .statistics()
+            .expect("plan statistics")
+    }
+
     #[test]
     fn int64_chunk_stats_round_trip() {
-        let stats = Int64ChunkStats { min: -7, max: 42 };
-        let decoded = Int64ChunkStats::try_from_slice(0, &stats.serialize()).expect("decode stats");
+        let stats = Int64Stats {
+            min: Some(-7),
+            max: Some(42),
+            null_count: 5,
+            distinct_count: Some(9),
+        };
+        let decoded = Int64Stats::deserialize(&stats.serialize()).expect("decode stats");
         assert_eq!(decoded, stats);
     }
 
@@ -859,5 +961,39 @@ mod tests {
             })
             .collect();
         assert_eq!(b_values, vec![1000, 2000, 3000]);
+    }
+
+    #[tokio::test]
+    async fn pruning_reduces_planned_scan_statistics() {
+        let file = write_chunked_test_file(&[
+            &[&[1, 2], &[10, 20]],
+            &[&[100, 200, 300], &[1000, 2000, 3000]],
+        ]);
+        let mmap = MmapFile::open(file.path()).expect("mmap");
+        let provider = ColumnarTableProvider::try_new(mmap.mmap_arc(), schema()).expect("provider");
+
+        let unfiltered = scan_statistics(&provider, Some(vec![1]), vec![]).await;
+        let filtered = scan_statistics(
+            &provider,
+            Some(vec![1]),
+            vec![Expr::gt_eq(
+                datafusion::logical_expr::col("a"),
+                Expr::Literal(ScalarValue::Int64(Some(100))),
+            )],
+        )
+        .await;
+
+        assert_eq!(unfiltered.num_rows, Precision::Exact(5));
+        assert_eq!(filtered.num_rows, Precision::Exact(3));
+        assert_eq!(unfiltered.total_byte_size, Precision::Exact(40));
+        assert_eq!(filtered.total_byte_size, Precision::Exact(24));
+        assert_eq!(
+            filtered.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int64(Some(1000)))
+        );
+        assert_eq!(
+            filtered.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(3000)))
+        );
     }
 }

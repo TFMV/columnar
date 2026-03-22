@@ -4,6 +4,7 @@ mod align;
 mod directory;
 mod header;
 mod reader;
+mod stats;
 mod writer;
 
 pub use align::{align_offset, pad_length};
@@ -18,6 +19,7 @@ pub use header::{
 pub use reader::{
     ColumnBufferSlices, ColumnarReadError, ColumnarReader, VariableColumnBufferSlices,
 };
+pub use stats::{ColumnStats, Int64Stats, StatsBlockError};
 pub use writer::{
     ColumnarWriteError, ColumnarWriter, ValueAlignmentStrategy, SECTION_ALIGN,
     V0_PHYSICAL_FIXED_WIDTH_I64, V0_PHYSICAL_UTF8_I32, V0_PHYSICAL_UTF8_I64, VALUES_BUFFER_ALIGN,
