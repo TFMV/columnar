@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::{Array, Int64Array, StringArray};
-use columnar_arrow::{build_int64_array_from_mmap, build_utf8_array_from_mmap};
+use columnar_arrow::{build_int64_array, build_utf8_array};
 use columnar_format::{ColumnarReader, ColumnarWriter, Int64Stats};
 use columnar_mmap::MmapFile;
 
@@ -142,8 +142,7 @@ fn assert_int64_round_trip(
         encode_validity(expected)
     );
 
-    let round_tripped =
-        build_int64_array_from_mmap(mmap.mmap_arc(), values, validity).expect("array");
+    let round_tripped = build_int64_array(mmap.mmap_arc(), values, validity).expect("array");
     assert_eq!(round_tripped.len(), expected.len());
     for index in 0..expected.len() {
         assert_eq!(round_tripped.is_null(index), expected.is_null(index));
@@ -170,7 +169,7 @@ fn assert_utf8_round_trip(
         encode_validity(expected)
     );
 
-    let round_tripped = build_utf8_array_from_mmap(
+    let round_tripped = build_utf8_array(
         mmap.mmap_arc(),
         variable.offsets,
         variable.values,

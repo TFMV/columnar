@@ -42,7 +42,7 @@ fn make_nulls(
     }
     let validity_ptr = validity.as_ptr() as usize;
     let alignment = MIN_BUFFER_ALIGN as usize;
-    if validity.len() > 0 && validity_ptr % alignment != 0 {
+    if !validity.is_empty() && validity_ptr % alignment != 0 {
         return Err(ArrowBuildError::ValidityMisaligned {
             ptr: validity_ptr,
             alignment,
@@ -53,15 +53,15 @@ fn make_nulls(
     Ok(Some(NullBuffer::new(boolean_buffer)))
 }
 
-/// Build an Arrow `ArrayData` for an `Int64` column using zero-copy Arrow buffers.
+/// Build an Arrow `Int64Array` from zero-copy buffers over a shared `Mmap` region.
 ///
-/// The returned buffers retain an internal `Arc<Mmap>` so the array remains valid even if the
-/// caller drops its `MmapFile`.
-pub fn int64_array_data_from_slices(
+/// The returned array and its buffers retain an internal `Arc<Mmap>` so the data remains valid
+/// even if the caller drops its original `MmapFile` handle.
+pub fn build_int64_array(
     mmap: Arc<Mmap>,
     values: &[u8],
     validity: Option<&[u8]>,
-) -> Result<ArrayData, ArrowBuildError> {
+) -> Result<Int64Array, ArrowBuildError> {
     let (values_buffer, len) = make_values_buffer(mmap.clone(), values)?;
     let nulls = make_nulls(mmap, validity, len)?;
 
@@ -69,26 +69,8 @@ pub fn int64_array_data_from_slices(
         .len(len)
         .add_buffer(values_buffer)
         .nulls(nulls);
-    builder.build().map_err(ArrowBuildError::Arrow)
-}
-
-/// Convenience wrapper returning an `Int64Array`.
-pub fn build_int64_array_from_mmap(
-    mmap: Arc<Mmap>,
-    values: &[u8],
-    validity: Option<&[u8]>,
-) -> Result<Int64Array, ArrowBuildError> {
-    let data = int64_array_data_from_slices(mmap, values, validity)?;
-    Ok(Int64Array::from(data))
-}
-
-/// Convenience wrapper returning an `ArrayData` (alias).
-pub fn build_int64_array_data_from_mmap(
-    mmap: Arc<Mmap>,
-    values: &[u8],
-    validity: Option<&[u8]>,
-) -> Result<ArrayData, ArrowBuildError> {
-    int64_array_data_from_slices(mmap, values, validity)
+    let array_data = builder.build().map_err(ArrowBuildError::Arrow)?;
+    Ok(Int64Array::from(array_data))
 }
 
 #[cfg(test)]
@@ -142,11 +124,27 @@ mod tests {
     }
 
     fn encode_i64(values: &[i64]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(values.len() * std::mem::size_of::<i64>());
-        for value in values {
-            out.extend_from_slice(&value.to_le_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: `i64` has a defined layout, and we are on a little-endian system, so
+            // a simple memory copy is correct.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    values.as_ptr() as *const u8,
+                    values.len() * std::mem::size_of::<i64>(),
+                )
+            };
+            bytes.to_vec()
         }
-        out
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut out = Vec::with_capacity(values.len() * std::mem::size_of::<i64>());
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            out
+        }
     }
 
     fn encode_validity(mask: &[bool]) -> Vec<u8> {
@@ -322,7 +320,7 @@ mod tests {
             let bytes = mmap.as_slice();
             let values_slice = &bytes[values_start..values_start + values.len() * 8];
 
-            let arr = build_int64_array_from_mmap(arc.clone(), values_slice, None).unwrap();
+            let arr = build_int64_array(arc.clone(), values_slice, None).unwrap();
             assert_eq!(
                 arr.values().inner().as_slice().as_ptr(),
                 values_slice.as_ptr()
@@ -355,7 +353,7 @@ mod tests {
             let values_slice = reader.column_values(0).unwrap();
             let validity_slice = reader.column_validity(0).unwrap();
 
-            build_int64_array_from_mmap(arc, values_slice, validity_slice).unwrap()
+            build_int64_array(arc, values_slice, validity_slice).unwrap()
         };
 
         for i in 0..values.len() {
@@ -389,7 +387,7 @@ mod tests {
 
             let len_bytes = values.len() * 8;
             let misaligned = &bytes[values_start + 1..values_start + 1 + len_bytes];
-            build_int64_array_from_mmap(arc, misaligned, None).unwrap_err()
+            build_int64_array(arc, misaligned, None).unwrap_err()
         };
 
         assert!(matches!(err, ArrowBuildError::ValuesMisaligned { .. }));
@@ -441,7 +439,7 @@ mod tests {
                 let len = rng.next_usize(remaining) + 1;
                 let byte_start = start * std::mem::size_of::<i64>();
                 let byte_end = byte_start + len * std::mem::size_of::<i64>();
-                let array = build_int64_array_from_mmap(
+                let array = build_int64_array(
                     arc.clone(),
                     &values_slice[byte_start..byte_end],
                     None,
@@ -505,7 +503,7 @@ mod tests {
                 let mut arrays = Vec::with_capacity(columns.len());
 
                 for (column_index, column) in columns.iter().enumerate() {
-                    let array = build_int64_array_from_mmap(
+                    let array = build_int64_array(
                         arc.clone(),
                         reader.column_values(column_index).unwrap(),
                         reader.column_validity(column_index).unwrap(),
