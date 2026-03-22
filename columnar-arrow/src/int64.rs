@@ -17,7 +17,10 @@ pub enum ArrowBuildError {
     /// `values` pointer not aligned for `i64`.
     ValuesMisaligned { ptr: usize, alignment: usize },
     /// `validity` length too small for `len` rows.
-    ValidityTooShort { got_bytes: usize, needed_bytes: usize },
+    ValidityTooShort {
+        got_bytes: usize,
+        needed_bytes: usize,
+    },
     /// `validity` pointer not aligned to Columnar alignment.
     ValidityMisaligned { ptr: usize, alignment: usize },
     /// The provided slice pointer does not fall within the provided mmap address range.
@@ -119,28 +122,55 @@ fn slice_within_mmap(mmap: &Mmap, slice: &[u8]) -> Result<(), ArrowBuildError> {
     Ok(())
 }
 
+fn mmap_range(
+    mmap: &Mmap,
+    offset: usize,
+    len: usize,
+) -> Result<(*const u8, usize), ArrowBuildError> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(ArrowBuildError::SliceNotWithinMmap {
+            slice_ptr: mmap.as_ref().as_ptr() as usize + offset,
+            slice_len: len,
+            mmap_len: mmap.len(),
+        })?;
+    if end > mmap.len() {
+        return Err(ArrowBuildError::SliceNotWithinMmap {
+            slice_ptr: mmap.as_ref().as_ptr() as usize + offset,
+            slice_len: len,
+            mmap_len: mmap.len(),
+        });
+    }
+
+    let ptr = if len == 0 {
+        if mmap.is_empty() {
+            std::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else {
+            // SAFETY: `mmap` is non-empty, so its base pointer is valid for zero-offset access.
+            mmap.as_ref().as_ptr()
+        }
+    } else {
+        // SAFETY: `end <= mmap.len()` was checked above, so `offset` lies within the mapping and
+        // `base.add(offset)` produces a pointer to the first byte of the requested range.
+        unsafe { mmap.as_ref().as_ptr().add(offset) }
+    };
+
+    Ok((ptr, len))
+}
+
 impl MmapBuffer {
     /// Create a zero-copy mmap-backed buffer view for `slice`.
     pub fn try_new(arc: Arc<Mmap>, slice: &[u8]) -> Result<Self, ArrowBuildError> {
         slice_within_mmap(&arc, slice)?;
-        let ptr = if slice.is_empty() {
-            // Zero-length buffers never dereference their pointer. Use the mmap base when
-            // available, and a dangling non-null pointer for empty mmaps so Arrow still gets a
-            // valid non-null raw pointer representation without allocating.
-            if arc.is_empty() {
-                std::ptr::NonNull::<u8>::dangling().as_ptr()
-            } else {
-                arc.as_ref().as_ptr()
-            }
-        } else {
-            slice.as_ptr()
-        };
+        let base = arc.as_ref().as_ptr() as usize;
+        let ptr = slice.as_ptr() as usize;
+        let offset = ptr.saturating_sub(base);
+        Self::from_mmap_range(arc, offset, slice.len())
+    }
 
-        Ok(Self {
-            arc,
-            ptr,
-            len: slice.len(),
-        })
+    fn from_mmap_range(arc: Arc<Mmap>, offset: usize, len: usize) -> Result<Self, ArrowBuildError> {
+        let (ptr, len) = mmap_range(&arc, offset, len)?;
+        Ok(Self { arc, ptr, len })
     }
 
     #[inline]
@@ -151,8 +181,8 @@ impl MmapBuffer {
     /// Convert this mmap-backed view into an Arrow `Buffer` without copying.
     fn into_arrow_buffer(self) -> Buffer {
         let owner: Arc<dyn ArrowAllocation> = Arc::new(MmapOwner { _mmap: self.arc });
-        let ptr = std::ptr::NonNull::new(self.ptr as *mut u8)
-            .unwrap_or_else(std::ptr::NonNull::dangling);
+        let ptr =
+            std::ptr::NonNull::new(self.ptr as *mut u8).unwrap_or_else(std::ptr::NonNull::dangling);
 
         // SAFETY:
         // - `ptr` is non-null. For `len > 0`, it comes from a slice already validated to lie
@@ -167,10 +197,7 @@ impl MmapBuffer {
     }
 }
 
-fn make_values_buffer(
-    mmap: Arc<Mmap>,
-    values: &[u8],
-) -> Result<(Buffer, usize), ArrowBuildError> {
+fn make_values_buffer(mmap: Arc<Mmap>, values: &[u8]) -> Result<(Buffer, usize), ArrowBuildError> {
     if values.len() % 8 != 0 {
         return Err(ArrowBuildError::InvalidValuesLength { got: values.len() });
     }
@@ -258,10 +285,130 @@ mod tests {
     use super::*;
     use arrow_array::Array;
     use columnar_format::{
-        ColumnMeta, ColumnarReader, FileHeader, FILE_HEADER_MAGIC, FILE_HEADER_LEN,
-        FILE_HEADER_ON_DISK_SIZE, V0_PHYSICAL_FIXED_WIDTH_I64, COLUMN_META_LEN, align_offset,
+        align_offset, ColumnMeta, ColumnarReader, ColumnarWriter, FileHeader, COLUMN_META_LEN,
+        FILE_HEADER_LEN, FILE_HEADER_MAGIC, FILE_HEADER_ON_DISK_SIZE, V0_PHYSICAL_FIXED_WIDTH_I64,
+        VALUES_BUFFER_ALIGN,
     };
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone)]
+    struct TestColumn {
+        values: Vec<i64>,
+        validity: Option<Vec<bool>>,
+    }
+
+    #[derive(Clone)]
+    struct RetainedArray {
+        values: Vec<i64>,
+        validity: Option<Vec<bool>>,
+        array: Int64Array,
+    }
+
+    struct Lcg {
+        state: u64,
+    }
+
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.state = self
+                .state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            self.state
+        }
+
+        fn next_usize(&mut self, upper_exclusive: usize) -> usize {
+            assert!(upper_exclusive > 0);
+            (self.next_u64() % upper_exclusive as u64) as usize
+        }
+    }
+
+    fn encode_i64(values: &[i64]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * std::mem::size_of::<i64>());
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    fn encode_validity(mask: &[bool]) -> Vec<u8> {
+        let mut bitmap = vec![0u8; mask.len().div_ceil(8)];
+        for (index, valid) in mask.iter().copied().enumerate() {
+            if valid {
+                bitmap[index / 8] |= 1u8 << (index % 8);
+            }
+        }
+        bitmap
+    }
+
+    fn unique_temp_path(label: &str) -> std::path::PathBuf {
+        let unique = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "{label}_{}_{}.columnar",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    fn write_multi_column_file(columns: &[TestColumn]) -> Vec<u8> {
+        let mut writer = ColumnarWriter::new();
+        writer.write_header_placeholder().expect("header");
+        writer.write_schema_block(b"ipc-schema").expect("schema");
+        writer
+            .reserve_column_directory(columns.len())
+            .expect("reserve directory");
+
+        let mut metas = Vec::with_capacity(columns.len());
+        for (index, column) in columns.iter().enumerate() {
+            let (validity_offset, validity_length) = if let Some(validity) = &column.validity {
+                assert_eq!(validity.len(), column.values.len());
+                writer
+                    .pad_to_alignment(MIN_BUFFER_ALIGN as usize)
+                    .expect("align validity");
+                let bitmap = encode_validity(validity);
+                writer
+                    .write_fixed_width_values(&bitmap, 1)
+                    .expect("write validity")
+            } else {
+                (0, 0)
+            };
+
+            writer
+                .pad_to_alignment(VALUES_BUFFER_ALIGN)
+                .expect("align values");
+            let encoded = encode_i64(&column.values);
+            let (data_offset, data_length) = writer
+                .write_fixed_width_values(&encoded, std::mem::size_of::<i64>())
+                .expect("write values");
+
+            metas.push(ColumnMeta {
+                column_id: index as u32,
+                physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
+                logical_type: 0,
+                data_offset,
+                data_length,
+                validity_offset,
+                validity_length,
+                offsets_offset: 0,
+                offsets_length: 0,
+                stats_offset: 0,
+                stats_length: 0,
+            });
+        }
+
+        writer
+            .patch_column_directory(&metas)
+            .expect("patch directory");
+        writer.finalize_header().expect("finalize header");
+        writer.into_inner()
+    }
 
     fn write_test_file(values: &[i64], validity: Option<&[bool]>) -> (Vec<u8>, usize) {
         let rows = values.len();
@@ -354,10 +501,8 @@ mod tests {
         let values = [10i64, -2, 33, 4];
         let (file, values_start) = write_test_file(&values, None);
 
-        let path = std::env::temp_dir().join(format!(
-            "col_arrow_drop_{}.columnar",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("col_arrow_drop_{}.columnar", std::process::id()));
         fs::write(&path, &file).unwrap();
 
         let array = {
@@ -367,7 +512,10 @@ mod tests {
             let values_slice = &bytes[values_start..values_start + values.len() * 8];
 
             let arr = build_int64_array_from_mmap(arc.clone(), values_slice, None).unwrap();
-            assert_eq!(arr.values().inner().as_slice().as_ptr(), values_slice.as_ptr());
+            assert_eq!(
+                arr.values().inner().as_slice().as_ptr(),
+                values_slice.as_ptr()
+            );
             arr
         };
 
@@ -383,10 +531,8 @@ mod tests {
         let mask = [true, false, true, true, false];
         let (file, _values_start) = write_test_file(&values, Some(&mask));
 
-        let path = std::env::temp_dir().join(format!(
-            "col_arrow_valid_{}.columnar",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("col_arrow_valid_{}.columnar", std::process::id()));
         fs::write(&path, &file).unwrap();
 
         let array = {
@@ -437,5 +583,163 @@ mod tests {
 
         assert!(matches!(err, ArrowBuildError::ValuesMisaligned { .. }));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mmap_backed_buffer_survives_original_handle_drop() {
+        let values = [11i64, 22, 33];
+        let (file, values_start) = write_test_file(&values, None);
+
+        let path = std::env::temp_dir().join(format!(
+            "col_arrow_buffer_drop_{}.columnar",
+            std::process::id()
+        ));
+        fs::write(&path, &file).unwrap();
+
+        let buffer = {
+            let mmap = columnar_mmap::MmapFile::open(&path).unwrap();
+            let arc = mmap.mmap_arc();
+            MmapBuffer::from_mmap_range(arc, values_start, values.len() * 8)
+                .unwrap()
+                .into_arrow_buffer()
+        };
+
+        let typed = buffer.typed_data::<i64>();
+        assert_eq!(typed, values.as_slice());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn randomized_valid_windows_survive_mmap_handle_drop() {
+        let values: Vec<i64> = (0..256).map(|index| (index as i64 * 17) - 9_000).collect();
+        let (file, values_start) = write_test_file(&values, None);
+        let path = unique_temp_path("col_arrow_random_windows");
+        fs::write(&path, &file).unwrap();
+
+        let windows = {
+            let mmap = columnar_mmap::MmapFile::open(&path).unwrap();
+            let arc = mmap.mmap_arc();
+            let bytes = mmap.as_slice();
+            let values_slice = &bytes[values_start..values_start + values.len() * 8];
+            let mut rng = Lcg::new(0x5eed_cafe_d00d_beef);
+            let mut windows = Vec::with_capacity(128);
+
+            for _ in 0..128 {
+                let start = rng.next_usize(values.len());
+                let remaining = values.len() - start;
+                let len = rng.next_usize(remaining) + 1;
+                let byte_start = start * std::mem::size_of::<i64>();
+                let byte_end = byte_start + len * std::mem::size_of::<i64>();
+                let array = build_int64_array_from_mmap(
+                    arc.clone(),
+                    &values_slice[byte_start..byte_end],
+                    None,
+                )
+                .unwrap();
+                windows.push((start, len, array));
+            }
+
+            windows
+        };
+
+        for (start, len, array) in windows {
+            assert_eq!(array.len(), len);
+            for index in 0..len {
+                assert_eq!(array.value(index), values[start + index]);
+            }
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stress_multiple_columns_and_batches_survive_handle_drop() {
+        let mut retained = Vec::new();
+        let mut paths = Vec::new();
+
+        for batch_index in 0..6 {
+            let columns: Vec<TestColumn> = (0..4)
+                .map(|column_index| {
+                    let rows = 48 + batch_index * 7 + column_index * 5;
+                    let values: Vec<i64> = (0..rows)
+                        .map(|row| {
+                            (batch_index as i64 * 10_000)
+                                + (column_index as i64 * 1_000)
+                                + (row as i64 * 3)
+                                - 77
+                        })
+                        .collect();
+                    let validity = if column_index % 2 == 0 {
+                        Some(
+                            (0..rows)
+                                .map(|row| (row + batch_index + column_index) % 3 != 1)
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    };
+                    TestColumn { values, validity }
+                })
+                .collect();
+
+            let file = write_multi_column_file(&columns);
+            let path = unique_temp_path(&format!("col_arrow_stress_batch_{batch_index}"));
+            fs::write(&path, &file).unwrap();
+            paths.push(path.clone());
+
+            let batch_arrays = {
+                let mmap = columnar_mmap::MmapFile::open(&path).unwrap();
+                let arc = mmap.mmap_arc();
+                let reader = ColumnarReader::new(mmap.as_slice()).unwrap();
+                let mut arrays = Vec::with_capacity(columns.len());
+
+                for (column_index, column) in columns.iter().enumerate() {
+                    let array = build_int64_array_from_mmap(
+                        arc.clone(),
+                        reader.column_values(column_index).unwrap(),
+                        reader.column_validity(column_index).unwrap(),
+                    )
+                    .unwrap();
+                    arrays.push(RetainedArray {
+                        values: column.values.clone(),
+                        validity: column.validity.clone(),
+                        array,
+                    });
+                }
+
+                arrays
+            };
+
+            retained.extend(batch_arrays);
+        }
+
+        for retained_array in retained {
+            assert_eq!(retained_array.array.len(), retained_array.values.len());
+            match retained_array.validity.as_ref() {
+                Some(validity) => {
+                    for (index, expected_valid) in validity.iter().copied().enumerate() {
+                        if expected_valid {
+                            assert!(retained_array.array.is_valid(index));
+                            assert_eq!(
+                                retained_array.array.value(index),
+                                retained_array.values[index]
+                            );
+                        } else {
+                            assert!(retained_array.array.is_null(index));
+                        }
+                    }
+                }
+                None => {
+                    for (index, expected) in retained_array.values.iter().copied().enumerate() {
+                        assert!(retained_array.array.is_valid(index));
+                        assert_eq!(retained_array.array.value(index), expected);
+                    }
+                }
+            }
+        }
+
+        for path in paths {
+            let _ = fs::remove_file(path);
+        }
     }
 }

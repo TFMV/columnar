@@ -27,15 +27,9 @@ pub enum ColumnarWriteError {
     /// `reserve_column_directory` was given `columns == 0`.
     ZeroColumns,
     /// `patch_column_directory` entry count does not match the reserved size.
-    DirectoryColumnMismatch {
-        reserved: usize,
-        got: usize,
-    },
+    DirectoryColumnMismatch { reserved: usize, got: usize },
     /// `write_fixed_width_values` when `values.len()` is not a multiple of `element_width`.
-    ValuesLengthNotMultiple {
-        len: usize,
-        element_width: usize,
-    },
+    ValuesLengthNotMultiple { len: usize, element_width: usize },
     /// `element_width == 0` in `write_fixed_width_values`.
     ZeroElementWidth,
     /// `usize` overflow sizing the directory.
@@ -46,7 +40,9 @@ impl core::fmt::Display for ColumnarWriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ColumnarWriteError::State(s) => write!(f, "{s}"),
-            ColumnarWriteError::ZeroColumns => write!(f, "column directory must have at least one column"),
+            ColumnarWriteError::ZeroColumns => {
+                write!(f, "column directory must have at least one column")
+            }
             ColumnarWriteError::DirectoryColumnMismatch { reserved, got } => {
                 write!(f, "directory patch: reserved {reserved} columns, got {got}")
             }
@@ -96,10 +92,14 @@ impl ColumnarWriter {
     /// Writes a 64-byte **placeholder** header (zeros). Must be called on an empty writer.
     pub fn write_header_placeholder(&mut self) -> Result<(), ColumnarWriteError> {
         if self.header_written {
-            return Err(ColumnarWriteError::State("header placeholder already written"));
+            return Err(ColumnarWriteError::State(
+                "header placeholder already written",
+            ));
         }
         if !self.buf.is_empty() {
-            return Err(ColumnarWriteError::State("buffer must be empty before header"));
+            return Err(ColumnarWriteError::State(
+                "buffer must be empty before header",
+            ));
         }
         self.buf.resize(FILE_HEADER_LEN, 0);
         self.header_written = true;
@@ -109,13 +109,17 @@ impl ColumnarWriter {
     /// Appends the raw Arrow IPC schema bytes, then pads the file to [`SECTION_ALIGN`].
     pub fn write_schema_block(&mut self, schema: &[u8]) -> Result<(), ColumnarWriteError> {
         if !self.header_written {
-            return Err(ColumnarWriteError::State("call write_header_placeholder first"));
+            return Err(ColumnarWriteError::State(
+                "call write_header_placeholder first",
+            ));
         }
         if self.schema_written {
             return Err(ColumnarWriteError::State("schema block already written"));
         }
         if self.buf.len() != FILE_HEADER_LEN {
-            return Err(ColumnarWriteError::State("corrupt buffer length before schema"));
+            return Err(ColumnarWriteError::State(
+                "corrupt buffer length before schema",
+            ));
         }
         self.buf.extend_from_slice(schema);
         self.schema_raw_len = schema.len() as u64;
@@ -127,12 +131,17 @@ impl ColumnarWriter {
 
     /// Reserves a zero-filled column directory for `columns` entries at the current offset.
     /// The directory begins at an [`SECTION_ALIGN`]-byte aligned offset (enforced by prior padding).
-    pub fn reserve_column_directory(&mut self, columns: usize) -> Result<usize, ColumnarWriteError> {
+    pub fn reserve_column_directory(
+        &mut self,
+        columns: usize,
+    ) -> Result<usize, ColumnarWriteError> {
         if !self.schema_written {
             return Err(ColumnarWriteError::State("call write_schema_block first"));
         }
         if self.dir_reserved {
-            return Err(ColumnarWriteError::State("column directory already reserved"));
+            return Err(ColumnarWriteError::State(
+                "column directory already reserved",
+            ));
         }
         if columns == 0 {
             return Err(ColumnarWriteError::ZeroColumns);
@@ -198,7 +207,10 @@ impl ColumnarWriter {
     }
 
     /// Overwrites the reserved directory region with serialized [`ColumnMeta`] entries.
-    pub fn patch_column_directory(&mut self, entries: &[ColumnMeta]) -> Result<(), ColumnarWriteError> {
+    pub fn patch_column_directory(
+        &mut self,
+        entries: &[ColumnMeta],
+    ) -> Result<(), ColumnarWriteError> {
         if !self.dir_reserved {
             return Err(ColumnarWriteError::State("directory not reserved"));
         }
@@ -219,7 +231,9 @@ impl ColumnarWriter {
             .checked_add(need)
             .ok_or(ColumnarWriteError::SizeOverflow)?;
         if end > self.buf.len() {
-            return Err(ColumnarWriteError::State("directory patch past end of buffer"));
+            return Err(ColumnarWriteError::State(
+                "directory patch past end of buffer",
+            ));
         }
         for (index, entry) in entries.iter().enumerate() {
             let start = self.dir_start + index * COLUMN_META_LEN;

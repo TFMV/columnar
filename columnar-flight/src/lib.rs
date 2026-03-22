@@ -7,7 +7,7 @@ use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery};
-use arrow_flight::{FlightDescriptor, FlightEndpoint, FlightInfo, FlightData, Ticket};
+use arrow_flight::{FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
 use arrow_schema::ArrowError;
 use datafusion::dataframe::DataFrame;
 use datafusion::prelude::SessionContext;
@@ -57,7 +57,10 @@ impl ColumnarFlightSqlServer {
 
     async fn insert_statement(&self, dataframe: DataFrame) -> Vec<u8> {
         let handle = Self::new_statement_handle();
-        self.statements.lock().await.insert(handle.clone(), dataframe);
+        self.statements
+            .lock()
+            .await
+            .insert(handle.clone(), dataframe);
         handle
     }
 
@@ -65,10 +68,7 @@ impl ColumnarFlightSqlServer {
         self.statements.lock().await.remove(handle)
     }
 
-    async fn create_statement(
-        &self,
-        query: &str,
-    ) -> Result<DataFrame, Status> {
+    async fn create_statement(&self, query: &str) -> Result<DataFrame, Status> {
         self.context.sql(query).await.map_err(datafusion_status)
     }
 }
@@ -118,8 +118,10 @@ impl FlightSqlService for ColumnarFlightSqlServer {
         &self,
         ticket: TicketStatementQuery,
         _request: Request<Ticket>,
-    ) -> Result<Response<<Self as arrow_flight::flight_service_server::FlightService>::DoGetStream>, Status>
-    {
+    ) -> Result<
+        Response<<Self as arrow_flight::flight_service_server::FlightService>::DoGetStream>,
+        Status,
+    > {
         let dataframe = self
             .take_statement(ticket.statement_handle.as_ref())
             .await

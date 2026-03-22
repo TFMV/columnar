@@ -107,7 +107,8 @@ impl LocalAdbcConnection {
     /// This preserves zero-copy semantics from DataFusion’s underlying providers because the
     /// returned stream forwards `RecordBatch` values directly without collecting or rewriting them.
     pub async fn execute(&self, sql: &str) -> Result<QueryResultStream, ColumnarAdbcError> {
-        let stream: SendableRecordBatchStream = self.context.sql(sql).await?.execute_stream().await?;
+        let stream: SendableRecordBatchStream =
+            self.context.sql(sql).await?.execute_stream().await?;
         Ok(stream.map_err(ColumnarAdbcError::from).boxed())
     }
 }
@@ -129,7 +130,9 @@ impl FlightSqlAdbcDriver {
     /// Open a remote Flight SQL connection.
     pub async fn connect(&self) -> Result<FlightSqlAdbcConnection, ColumnarAdbcError> {
         let channel = Channel::from_shared(self.endpoint.clone())
-            .map_err(|error| ColumnarAdbcError::Flight(FlightError::ExternalError(Box::new(error))))?
+            .map_err(|error| {
+                ColumnarAdbcError::Flight(FlightError::ExternalError(Box::new(error)))
+            })?
             .connect()
             .await?;
         Ok(FlightSqlAdbcConnection {

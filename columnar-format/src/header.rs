@@ -58,7 +58,10 @@ impl std::fmt::Display for FileHeaderError {
             }
             FileHeaderError::BadMagic => write!(f, "invalid magic (expected COLUMNAR)"),
             FileHeaderError::UnsupportedVersion { got } => {
-                write!(f, "unsupported header version {got} (expected {FILE_HEADER_VERSION})")
+                write!(
+                    f,
+                    "unsupported header version {got} (expected {FILE_HEADER_VERSION})"
+                )
             }
             FileHeaderError::InvalidHeaderSize { got } => write!(
                 f,
@@ -77,9 +80,7 @@ impl FileHeader {
             return Err(FileHeaderError::BadMagic);
         }
         if self.version != FILE_HEADER_VERSION {
-            return Err(FileHeaderError::UnsupportedVersion {
-                got: self.version,
-            });
+            return Err(FileHeaderError::UnsupportedVersion { got: self.version });
         }
         if self.header_size != FILE_HEADER_ON_DISK_SIZE {
             return Err(FileHeaderError::InvalidHeaderSize {
@@ -179,12 +180,7 @@ mod tests {
     fn invalid_size_too_short() {
         let bytes = [0u8; 32];
         let err = FileHeader::deserialize(&bytes).unwrap_err();
-        assert_eq!(
-            err,
-            FileHeaderError::WrongLength {
-                got: 32
-            }
-        );
+        assert_eq!(err, FileHeaderError::WrongLength { got: 32 });
     }
 
     #[test]
@@ -205,10 +201,7 @@ mod tests {
         let mut h = sample_header();
         h.version = 999;
         let err = FileHeader::deserialize(&h.serialize()).unwrap_err();
-        assert_eq!(
-            err,
-            FileHeaderError::UnsupportedVersion { got: 999 }
-        );
+        assert_eq!(err, FileHeaderError::UnsupportedVersion { got: 999 });
     }
 
     #[test]
@@ -216,10 +209,7 @@ mod tests {
         let mut h = sample_header();
         h.header_size = 56;
         let err = FileHeader::deserialize(&h.serialize()).unwrap_err();
-        assert_eq!(
-            err,
-            FileHeaderError::InvalidHeaderSize { got: 56 }
-        );
+        assert_eq!(err, FileHeaderError::InvalidHeaderSize { got: 56 });
     }
 
     #[test]

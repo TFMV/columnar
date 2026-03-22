@@ -54,10 +54,7 @@ pub enum ColumnDirectoryError {
     /// `ColumnMeta` slice shorter than [`COLUMN_META_LEN`].
     TruncatedEntry { need: usize, got: usize },
     /// Directory byte length is not a multiple of [`COLUMN_META_LEN`].
-    WrongDirectoryLength {
-        got: usize,
-        multiple_of: usize,
-    },
+    WrongDirectoryLength { got: usize, multiple_of: usize },
     /// Bytes `[12..16]` in a wire record must be zero.
     NonZeroMetaPadding { got: u32 },
     /// Buffer start not aligned to [`MIN_BUFFER_ALIGN`] while length &gt; 0.
@@ -94,10 +91,7 @@ pub enum ColumnDirectoryError {
         end_b: u64,
     },
     /// `serialize_into` / `deserialize` expected a different buffer size.
-    WrongSerializeBufferLen {
-        need: usize,
-        got: usize,
-    },
+    WrongSerializeBufferLen { need: usize, got: usize },
     /// Column index out of range for [`ColumnDirectoryView::get`].
     InvalidColumnIndex { index: usize, len: usize },
 }
@@ -380,12 +374,14 @@ fn checked_end(
     offset: u64,
     length: u64,
 ) -> Result<u64, ColumnDirectoryError> {
-    let end = offset.checked_add(length).ok_or(ColumnDirectoryError::BufferLengthOverflow {
-        column_index,
-        field,
-        offset,
-        length,
-    })?;
+    let end = offset
+        .checked_add(length)
+        .ok_or(ColumnDirectoryError::BufferLengthOverflow {
+            column_index,
+            field,
+            offset,
+            length,
+        })?;
     Ok(end)
 }
 
@@ -642,10 +638,7 @@ mod tests {
         let mut b = meta(0, 0, 0, 0, 0, 0, 0, 0, 0).serialize();
         b[12..16].copy_from_slice(&1u32.to_le_bytes());
         let err = ColumnMeta::deserialize(&b).unwrap_err();
-        assert_eq!(
-            err,
-            ColumnDirectoryError::NonZeroMetaPadding { got: 1 }
-        );
+        assert_eq!(err, ColumnDirectoryError::NonZeroMetaPadding { got: 1 });
     }
 
     #[test]
