@@ -2,15 +2,17 @@
 # see: https://firebase.google.com/docs/studio/customize-workspace
 { pkgs, ... }: {
   # Which nixpkgs channel to use.
-  channel = "stable-24.05"; # or "unstable"
+  channel = "unstable"; # or "unstable"
 
   # Use https://search.nixos.org/packages to find packages
   packages = [
-    # pkgs.go
-    # pkgs.python311
+    pkgs.go
+    pkgs.python311
     # pkgs.python311Packages.pip
     # pkgs.nodejs_20
     # pkgs.nodePackages.nodemon
+    pkgs.cargo
+    pkgs.rustc
   ];
 
   # Sets environment variables in the workspace
@@ -49,6 +51,7 @@
       onStart = {
         # Example: start a background task to watch and re-build backend code
         # watch-backend = "npm run watch-backend";
+        install-rust = "rustup toolchain install 1.94 && rustup default 1.94";
       };
     };
   };
