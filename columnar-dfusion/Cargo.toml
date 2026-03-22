@@ -8,3 +8,18 @@ rust-version.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+arrow-array = "54.3.1"
+arrow-schema = "54.3.1"
+async-trait = "0.1.89"
+columnar-arrow = { path = "../columnar-arrow" }
+columnar-format = { path = "../columnar-format" }
+datafusion = "46.0.1"
+datafusion-expr = "46.0.1"
+memmap2 = "0.9.10"
+
+[dev-dependencies]
+columnar-mmap = { path = "../columnar-mmap" }
+tempfile = "3.20.0"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
