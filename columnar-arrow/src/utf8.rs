@@ -174,62 +174,42 @@ fn make_nulls(
     ))))
 }
 
-pub fn utf8_array_data_from_slices(
-    mmap: Arc<Mmap>,
-    offsets: &[u8],
-    values: &[u8],
-    validity: Option<&[u8]>,
-) -> Result<ArrayData, ArrowBuildError> {
-    let (offsets_buffer, len) = make_offsets_buffer_i32(mmap.clone(), offsets, values.len())?;
-    let values_buffer = make_values_buffer(mmap.clone(), values)?;
-    let nulls = make_nulls(mmap, validity, len)?;
-    ArrayData::builder(DataType::Utf8)
-        .len(len)
-        .add_buffer(offsets_buffer)
-        .add_buffer(values_buffer)
-        .nulls(nulls)
-        .build()
-        .map_err(ArrowBuildError::Arrow)
-}
-
-pub fn build_utf8_array_from_mmap(
+pub fn build_utf8_array(
     mmap: Arc<Mmap>,
     offsets: &[u8],
     values: &[u8],
     validity: Option<&[u8]>,
 ) -> Result<StringArray, ArrowBuildError> {
-    Ok(StringArray::from(utf8_array_data_from_slices(
-        mmap, offsets, values, validity,
-    )?))
-}
-
-pub fn large_utf8_array_data_from_slices(
-    mmap: Arc<Mmap>,
-    offsets: &[u8],
-    values: &[u8],
-    validity: Option<&[u8]>,
-) -> Result<ArrayData, ArrowBuildError> {
-    let (offsets_buffer, len) = make_offsets_buffer_i64(mmap.clone(), offsets, values.len())?;
+    let (offsets_buffer, len) = make_offsets_buffer_i32(mmap.clone(), offsets, values.len())?;
     let values_buffer = make_values_buffer(mmap.clone(), values)?;
     let nulls = make_nulls(mmap, validity, len)?;
-    ArrayData::builder(DataType::LargeUtf8)
+    let array_data = ArrayData::builder(DataType::Utf8)
         .len(len)
         .add_buffer(offsets_buffer)
         .add_buffer(values_buffer)
         .nulls(nulls)
         .build()
-        .map_err(ArrowBuildError::Arrow)
+        .map_err(ArrowBuildError::Arrow)?;
+    Ok(StringArray::from(array_data))
 }
 
-pub fn build_large_utf8_array_from_mmap(
+pub fn build_large_utf8_array(
     mmap: Arc<Mmap>,
     offsets: &[u8],
     values: &[u8],
     validity: Option<&[u8]>,
 ) -> Result<LargeStringArray, ArrowBuildError> {
-    Ok(LargeStringArray::from(large_utf8_array_data_from_slices(
-        mmap, offsets, values, validity,
-    )?))
+    let (offsets_buffer, len) = make_offsets_buffer_i64(mmap.clone(), offsets, values.len())?;
+    let values_buffer = make_values_buffer(mmap.clone(), values)?;
+    let nulls = make_nulls(mmap, validity, len)?;
+    let array_data = ArrayData::builder(DataType::LargeUtf8)
+        .len(len)
+        .add_buffer(offsets_buffer)
+        .add_buffer(values_buffer)
+        .nulls(nulls)
+        .build()
+        .map_err(ArrowBuildError::Arrow)?;
+    Ok(LargeStringArray::from(array_data))
 }
 
 #[cfg(test)]
@@ -265,19 +245,51 @@ mod tests {
     }
 
     fn encode_i32_offsets(offsets: &[i32]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(std::mem::size_of_val(offsets));
-        for offset in offsets {
-            out.extend_from_slice(&offset.to_le_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: `i32` has a defined layout, and we are on a little-endian system, so
+            // a simple memory copy is correct.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    offsets.as_ptr() as *const u8,
+                    offsets.len() * std::mem::size_of::<i32>(),
+                )
+            };
+            bytes.to_vec()
         }
-        out
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut out = Vec::with_capacity(std::mem::size_of_val(offsets));
+            for offset in offsets {
+                out.extend_from_slice(&offset.to_le_bytes());
+            }
+            out
+        }
     }
 
     fn encode_i64_offsets(offsets: &[i64]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(std::mem::size_of_val(offsets));
-        for offset in offsets {
-            out.extend_from_slice(&offset.to_le_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: `i64` has a defined layout, and we are on a little-endian system, so
+            // a simple memory copy is correct.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    offsets.as_ptr() as *const u8,
+                    offsets.len() * std::mem::size_of::<i64>(),
+                )
+            };
+            bytes.to_vec()
         }
-        out
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut out = Vec::with_capacity(std::mem::size_of_val(offsets));
+            for offset in offsets {
+                out.extend_from_slice(&offset.to_le_bytes());
+            }
+            out
+        }
     }
 
     fn write_utf8_test_file(
@@ -349,7 +361,7 @@ mod tests {
             let arc = mmap.mmap_arc();
             let reader = ColumnarReader::new(mmap.as_slice()).unwrap();
             let variable = reader.variable_column_buffers(0).unwrap();
-            let array = build_utf8_array_from_mmap(
+            let array = build_utf8_array(
                 arc,
                 variable.offsets,
                 variable.values,
@@ -386,8 +398,7 @@ mod tests {
             let arc = mmap.mmap_arc();
             let reader = ColumnarReader::new(mmap.as_slice()).unwrap();
             let variable = reader.variable_column_buffers(0).unwrap();
-            build_utf8_array_from_mmap(arc, variable.offsets, variable.values, variable.validity)
-                .unwrap()
+            build_utf8_array(arc, variable.offsets, variable.values, variable.validity).unwrap()
         };
 
         assert_eq!(array.value(0), "alpha");
@@ -445,7 +456,7 @@ mod tests {
                 let arc = mmap.mmap_arc();
                 let reader = ColumnarReader::new(mmap.as_slice()).unwrap();
                 let variable = reader.variable_column_buffers(0).unwrap();
-                build_utf8_array_from_mmap(
+                build_utf8_array(
                     arc,
                     variable.offsets,
                     variable.values,
@@ -500,7 +511,7 @@ mod tests {
                 let arc = mmap.mmap_arc();
                 let reader = ColumnarReader::new(mmap.as_slice()).unwrap();
                 let variable = reader.variable_column_buffers(0).unwrap();
-                build_large_utf8_array_from_mmap(
+                build_large_utf8_array(
                     arc,
                     variable.offsets,
                     variable.values,
@@ -541,7 +552,7 @@ mod tests {
                 let arc = mmap.mmap_arc();
                 let reader = ColumnarReader::new(mmap.as_slice()).unwrap();
                 let variable = reader.variable_column_buffers(0).unwrap();
-                build_utf8_array_from_mmap(
+                build_utf8_array(
                     arc,
                     variable.offsets,
                     variable.values,
@@ -583,7 +594,7 @@ mod tests {
             let arc = mmap.mmap_arc();
             let reader = ColumnarReader::new(mmap.as_slice()).unwrap();
             let variable = reader.variable_column_buffers(0).unwrap();
-            build_large_utf8_array_from_mmap(
+            build_large_utf8_array(
                 arc,
                 variable.offsets,
                 variable.values,

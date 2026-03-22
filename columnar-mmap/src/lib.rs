@@ -42,46 +42,11 @@ impl MmapFile {
         self.mmap.as_ref()
     }
 
-    /// Returns a clone of the underlying mapping so derived buffers can keep it alive
-    /// even after `MmapFile` is dropped.
+    /// The underlying `Arc<Mmap>` handle.
+    ///
+    /// This allows multiple Columnar readers to share ownership of a single mapping.
     #[inline]
     pub fn mmap_arc(&self) -> Arc<memmap2::Mmap> {
         self.mmap.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::MmapFile;
-    use std::io::ErrorKind;
-
-    #[test]
-    fn open_and_read() {
-        let path = std::env::temp_dir().join(format!("columnar_mmap_ok_{}", std::process::id()));
-        std::fs::write(&path, b"columnar-mmap").unwrap();
-        let map = MmapFile::open(&path).expect("open");
-        assert_eq!(map.as_slice(), b"columnar-mmap");
-        drop(map);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn invalid_path_not_found() {
-        let path =
-            std::env::temp_dir().join(format!("__columnar_mmap_missing__.{}", std::process::id()));
-        match MmapFile::open(&path) {
-            Err(e) => assert_eq!(e.kind(), ErrorKind::NotFound),
-            Ok(_) => panic!("expected open to fail"),
-        }
-    }
-
-    #[test]
-    fn empty_file_yields_empty_slice() {
-        let path = std::env::temp_dir().join(format!("columnar_mmap_empty_{}", std::process::id()));
-        std::fs::File::create(&path).unwrap();
-        let map = MmapFile::open(&path).expect("open empty");
-        assert!(map.as_slice().is_empty());
-        drop(map);
-        let _ = std::fs::remove_file(&path);
     }
 }

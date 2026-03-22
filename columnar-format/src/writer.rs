@@ -1,4 +1,4 @@
-//! Build a v0 `.columnar` file: header, schema, column directory, then column buffers.
+'''//! Build a v0 `.columnar` file: header, schema, column directory, then column buffers.
 //!
 //! On-disk section order matches format §2.1: **header → schema → directory → chunks**. The writer
 //! reserves the directory after the schema, aligns for the values buffer (64-byte preferred per
@@ -747,6 +747,54 @@ mod tests {
     use super::*;
     use crate::{ColumnarReader, Int64Stats};
 
+    fn encode_i64(values: &[i64]) -> Vec<u8> {
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: `i64` has a defined layout, and we are on a little-endian system, so
+            // a simple memory copy is correct.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    values.as_ptr() as *const u8,
+                    values.len() * std::mem::size_of::<i64>(),
+                )
+            };
+            bytes.to_vec()
+        }
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut out = Vec::with_capacity(values.len() * std::mem::size_of::<i64>());
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            out
+        }
+    }
+
+    fn encode_i32(values: &[i32]) -> Vec<u8> {
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: `i32` has a defined layout, and we are on a little-endian system, so
+            // a simple memory copy is correct.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    values.as_ptr() as *const u8,
+                    values.len() * std::mem::size_of::<i32>(),
+                )
+            };
+            bytes.to_vec()
+        }
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut out = Vec::with_capacity(values.len() * std::mem::size_of::<i32>());
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            out
+        }
+    }
+
     fn encode_validity(mask: &[bool]) -> Vec<u8> {
         let mut bitmap = vec![0u8; mask.len().div_ceil(8)];
         for (index, valid) in mask.iter().copied().enumerate() {
@@ -764,10 +812,7 @@ mod tests {
         writer.write_schema_block(b"schema").unwrap();
         writer.reserve_column_directory(1).unwrap();
 
-        let values: Vec<u8> = [1i64, 2, 3]
-            .into_iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
+        let values = encode_i64(&[1, 2, 3]);
         let validity = encode_validity(&[true, false, true]);
         let meta = writer
             .write_int64_column_chunk(
@@ -813,10 +858,7 @@ mod tests {
         writer.write_schema_block(b"schema").unwrap();
         writer.reserve_column_directory(1).unwrap();
 
-        let offsets: Vec<u8> = [0i32, 5, 5, 9]
-            .into_iter()
-            .flat_map(|offset| offset.to_le_bytes())
-            .collect();
+        let offsets = encode_i32(&[0, 5, 5, 9]);
         let values = b"alphabeta";
         let validity = encode_validity(&[true, false, true]);
 
@@ -843,13 +885,11 @@ mod tests {
         writer.write_schema_block(b"schema").unwrap();
         writer.reserve_column_directory(1).unwrap();
 
-        let offsets: Vec<u8> = [0i32, 99]
-            .into_iter()
-            .flat_map(|offset| offset.to_le_bytes())
-            .collect();
+        let offsets = encode_i32(&[0, 99]);
         let err = writer
             .write_utf8_i32_column_chunk(0, 0, &offsets, b"abc", None, None)
             .unwrap_err();
         assert!(matches!(err, ColumnarWriteError::OffsetOutOfBounds { .. }));
     }
 }
+''
