@@ -4,13 +4,24 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
+use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight::sql::server::FlightSqlService;
-use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery};
-use arrow_flight::{FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
+use arrow_flight::sql::{
+    ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
+    ActionCreatePreparedStatementResult, CommandPreparedStatementQuery, CommandStatementQuery,
+    DoPutPreparedStatementResult, ProstMessageExt, SqlInfo, TicketStatementQuery,
+};
+use arrow_flight::{
+    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, IpcMessage, SchemaAsIpc, Ticket,
+};
+use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::ArrowError;
+use datafusion::common::ScalarValue;
 use datafusion::dataframe::DataFrame;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
@@ -27,7 +38,16 @@ use uuid::Uuid;
 pub struct ColumnarFlightSqlServer {
     context: Arc<SessionContext>,
     statements: Arc<Mutex<HashMap<Vec<u8>, DataFrame>>>,
+    prepared_statements: Arc<Mutex<HashMap<Vec<u8>, PreparedStatementState>>>,
     max_flight_data_size: usize,
+}
+
+#[derive(Clone)]
+struct PreparedStatementState {
+    plan: LogicalPlan,
+    dataset_schema: arrow_schema::Schema,
+    parameter_schema: arrow_schema::Schema,
+    bound_values: Option<Vec<ScalarValue>>,
 }
 
 impl ColumnarFlightSqlServer {
@@ -36,6 +56,7 @@ impl ColumnarFlightSqlServer {
         Self {
             context,
             statements: Arc::new(Mutex::new(HashMap::new())),
+            prepared_statements: Arc::new(Mutex::new(HashMap::new())),
             max_flight_data_size: arrow_flight::encode::GRPC_TARGET_MAX_FLIGHT_SIZE_BYTES,
         }
     }
@@ -82,6 +103,60 @@ impl ColumnarFlightSqlServer {
     async fn create_statement(&self, query: &str) -> Result<DataFrame, Status> {
         self.context.sql(query).await.map_err(datafusion_status)
     }
+
+    async fn create_prepared_statement(
+        &self,
+        query: &str,
+    ) -> Result<PreparedStatementState, Status> {
+        let session_state = self.context.state();
+        let plan = session_state
+            .create_logical_plan(query)
+            .await
+            .map_err(datafusion_status)?;
+        let dataset_schema = plan.schema().as_arrow().clone();
+        let parameter_schema = parameter_schema_from_plan(&plan)?;
+
+        Ok(PreparedStatementState {
+            plan,
+            dataset_schema,
+            parameter_schema,
+            bound_values: None,
+        })
+    }
+
+    async fn insert_prepared_statement(&self, statement: PreparedStatementState) -> Vec<u8> {
+        let handle = Self::new_statement_handle();
+        self.prepared_statements
+            .lock()
+            .await
+            .insert(handle.clone(), statement);
+        handle
+    }
+
+    async fn get_prepared_statement(&self, handle: &[u8]) -> Option<PreparedStatementState> {
+        self.prepared_statements.lock().await.get(handle).cloned()
+    }
+
+    async fn update_prepared_statement(
+        &self,
+        handle: &[u8],
+        statement: PreparedStatementState,
+    ) -> Result<(), Status> {
+        let mut statements = self.prepared_statements.lock().await;
+        let Some(slot) = statements.get_mut(handle) else {
+            return Err(Status::not_found("prepared statement handle not found"));
+        };
+        *slot = statement;
+        Ok(())
+    }
+
+    async fn remove_prepared_statement(&self, handle: &[u8]) -> bool {
+        self.prepared_statements
+            .lock()
+            .await
+            .remove(handle)
+            .is_some()
+    }
 }
 
 fn datafusion_status(error: datafusion::error::DataFusionError) -> Status {
@@ -97,6 +172,110 @@ fn encode_statement_ticket(handle: Vec<u8>) -> Ticket {
         statement_handle: handle.into(),
     };
     Ticket::new(statement.as_any().encode_to_vec())
+}
+
+fn ipc_schema_bytes(schema: &arrow_schema::Schema) -> Result<bytes::Bytes, Status> {
+    let IpcMessage(bytes) = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
+        .try_into()
+        .map_err(arrow_status)?;
+    Ok(bytes)
+}
+
+fn parameter_schema_from_plan(plan: &LogicalPlan) -> Result<arrow_schema::Schema, Status> {
+    let mut placeholders = plan
+        .get_parameter_types()
+        .map_err(datafusion_status)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    placeholders.sort_by(|(left, _), (right, _)| compare_placeholder_ids(left, right));
+
+    let mut fields = Vec::with_capacity(placeholders.len());
+    for (index, (id, data_type)) in placeholders.into_iter().enumerate() {
+        ensure_positional_placeholder(&id)?;
+        fields.push(arrow_schema::Field::new(
+            format!("p{}", index + 1),
+            data_type.unwrap_or(arrow_schema::DataType::Null),
+            true,
+        ));
+    }
+    Ok(arrow_schema::Schema::new(fields))
+}
+
+fn compare_placeholder_ids(left: &str, right: &str) -> std::cmp::Ordering {
+    match (
+        left.strip_prefix('$')
+            .and_then(|value| value.parse::<usize>().ok()),
+        right
+            .strip_prefix('$')
+            .and_then(|value| value.parse::<usize>().ok()),
+    ) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
+fn ensure_positional_placeholder(id: &str) -> Result<(), Status> {
+    let Some(value) = id.strip_prefix('$') else {
+        return Err(Status::invalid_argument(format!(
+            "unsupported placeholder format {id}"
+        )));
+    };
+    value.parse::<usize>().map(|_| ()).map_err(|_| {
+        Status::invalid_argument(format!(
+            "only positional placeholders are supported, got {id}"
+        ))
+    })
+}
+
+fn bind_parameters(
+    parameter_schema: &arrow_schema::Schema,
+    batch: &RecordBatch,
+) -> Result<Vec<ScalarValue>, Status> {
+    if batch.num_rows() != 1 {
+        return Err(Status::invalid_argument(format!(
+            "parameter batch must contain exactly 1 row, got {}",
+            batch.num_rows()
+        )));
+    }
+    if batch.num_columns() != parameter_schema.fields().len() {
+        return Err(Status::invalid_argument(format!(
+            "parameter batch has {} columns but statement expects {}",
+            batch.num_columns(),
+            parameter_schema.fields().len()
+        )));
+    }
+    if batch.schema().as_ref() != parameter_schema {
+        return Err(Status::invalid_argument(
+            "parameter batch schema does not match prepared statement schema",
+        ));
+    }
+
+    batch
+        .columns()
+        .iter()
+        .map(|array| ScalarValue::try_from_array(array, 0).map_err(datafusion_status))
+        .collect()
+}
+
+async fn decode_parameter_batch(
+    request: Request<arrow_flight::sql::server::PeekableFlightDataStream>,
+) -> Result<RecordBatch, Status> {
+    let stream = FlightRecordBatchStream::new_from_flight_data(
+        request.into_inner().map_err(FlightError::from),
+    );
+    let batches = stream
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?;
+    match batches.as_slice() {
+        [batch] => Ok(batch.clone()),
+        [] => Err(Status::invalid_argument(
+            "parameter binding stream did not contain a record batch",
+        )),
+        _ => Err(Status::invalid_argument(
+            "parameter binding stream must contain exactly one record batch",
+        )),
+    }
 }
 
 type FlightDataStream = BoxStream<'static, Result<FlightData, Status>>;
@@ -153,6 +332,113 @@ impl FlightSqlService for ColumnarFlightSqlServer {
             .boxed();
 
         Ok(Response::new(stream))
+    }
+
+    async fn get_flight_info_prepared_statement(
+        &self,
+        query: CommandPreparedStatementQuery,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let descriptor = request.into_inner();
+        let statement = self
+            .get_prepared_statement(query.prepared_statement_handle.as_ref())
+            .await
+            .ok_or_else(|| Status::not_found("prepared statement handle not found"))?;
+        let endpoint =
+            FlightEndpoint::new().with_ticket(Ticket::new(query.as_any().encode_to_vec()));
+        let flight_info = FlightInfo::new()
+            .try_with_schema(&statement.dataset_schema)
+            .map_err(arrow_status)?
+            .with_descriptor(descriptor)
+            .with_endpoint(endpoint);
+        Ok(Response::new(flight_info))
+    }
+
+    async fn do_get_prepared_statement(
+        &self,
+        query: CommandPreparedStatementQuery,
+        _request: Request<Ticket>,
+    ) -> Result<
+        Response<<Self as arrow_flight::flight_service_server::FlightService>::DoGetStream>,
+        Status,
+    > {
+        let statement = self
+            .get_prepared_statement(query.prepared_statement_handle.as_ref())
+            .await
+            .ok_or_else(|| Status::not_found("prepared statement handle not found"))?;
+        let dataframe = DataFrame::new(
+            self.context.state(),
+            statement
+                .plan
+                .clone()
+                .with_param_values(statement.bound_values.unwrap_or_default())
+                .map_err(datafusion_status)?,
+        );
+        let schema = Arc::new(statement.dataset_schema.clone());
+        let stream = dataframe
+            .execute_stream()
+            .await
+            .map_err(datafusion_status)?
+            .map_err(|error| FlightError::ExternalError(Box::new(error)));
+
+        let stream: FlightDataStream = arrow_flight::encode::FlightDataEncoderBuilder::new()
+            .with_max_flight_data_size(self.max_flight_data_size)
+            .with_schema(schema)
+            .build(stream)
+            .map_err(Status::from)
+            .boxed();
+        Ok(Response::new(stream))
+    }
+
+    async fn do_put_prepared_statement_query(
+        &self,
+        query: CommandPreparedStatementQuery,
+        request: Request<arrow_flight::sql::server::PeekableFlightDataStream>,
+    ) -> Result<DoPutPreparedStatementResult, Status> {
+        let mut statement = self
+            .get_prepared_statement(query.prepared_statement_handle.as_ref())
+            .await
+            .ok_or_else(|| Status::not_found("prepared statement handle not found"))?;
+        let batch = decode_parameter_batch(request).await?;
+        statement.bound_values = Some(bind_parameters(&statement.parameter_schema, &batch)?);
+        self.update_prepared_statement(query.prepared_statement_handle.as_ref(), statement)
+            .await?;
+
+        Ok(DoPutPreparedStatementResult {
+            prepared_statement_handle: Some(query.prepared_statement_handle),
+        })
+    }
+
+    async fn do_action_create_prepared_statement(
+        &self,
+        query: ActionCreatePreparedStatementRequest,
+        _request: Request<arrow_flight::Action>,
+    ) -> Result<ActionCreatePreparedStatementResult, Status> {
+        let statement = self.create_prepared_statement(&query.query).await?;
+        let dataset_schema = ipc_schema_bytes(&statement.dataset_schema)?;
+        let parameter_schema = ipc_schema_bytes(&statement.parameter_schema)?;
+        let handle = self.insert_prepared_statement(statement).await;
+
+        Ok(ActionCreatePreparedStatementResult {
+            prepared_statement_handle: handle.into(),
+            dataset_schema,
+            parameter_schema,
+        })
+    }
+
+    async fn do_action_close_prepared_statement(
+        &self,
+        query: ActionClosePreparedStatementRequest,
+        _request: Request<arrow_flight::Action>,
+    ) -> Result<(), Status> {
+        if self
+            .remove_prepared_statement(query.prepared_statement_handle.as_ref())
+            .await
+        {
+            Ok(())
+        } else {
+            Err(Status::not_found("prepared statement handle not found"))
+        }
     }
 
     async fn register_sql_info(&self, id: i32, result: &SqlInfo) {
