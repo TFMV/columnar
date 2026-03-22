@@ -7,6 +7,7 @@ use crate::directory::{
     MIN_BUFFER_ALIGN,
 };
 use crate::header::{FileHeader, FileHeaderError, FILE_HEADER_LEN};
+use crate::stats::{ColumnStats, Int64Stats, StatsBlockError};
 use crate::{V0_PHYSICAL_FIXED_WIDTH_I64, V0_PHYSICAL_UTF8_I32, V0_PHYSICAL_UTF8_I64};
 
 /// Parsed file with all payload views borrowing `bytes` (typically memory-mapped).
@@ -104,6 +105,10 @@ pub enum ColumnarReadError {
     UnsupportedPhysicalType {
         column_index: usize,
         physical_type: u32,
+    },
+    Stats {
+        column_index: usize,
+        source: StatsBlockError,
     },
 }
 
@@ -205,6 +210,10 @@ impl fmt::Display for ColumnarReadError {
                 f,
                 "column {column_index} uses unsupported physical type {physical_type}"
             ),
+            ColumnarReadError::Stats {
+                column_index,
+                source,
+            } => write!(f, "column {column_index} stats block is invalid: {source}"),
         }
     }
 }
@@ -213,6 +222,7 @@ impl std::error::Error for ColumnarReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ColumnarReadError::Header(e) => Some(e),
+            ColumnarReadError::Stats { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -308,6 +318,7 @@ impl<'a> ColumnarReader<'a> {
         };
         reader.validate_buffers_vs_structure(file_len)?;
         reader.validate_chunk_row_counts()?;
+        reader.validate_stats_blocks()?;
         Ok(reader)
     }
 
@@ -437,6 +448,48 @@ impl<'a> ColumnarReader<'a> {
             m.stats_offset,
             m.stats_length,
         )
+    }
+
+    pub fn column_typed_stats(
+        &self,
+        index: usize,
+    ) -> Result<Option<ColumnStats>, ColumnarReadError> {
+        self.chunk_column_typed_stats(0, index)
+    }
+
+    pub fn chunk_column_typed_stats(
+        &self,
+        chunk_index: usize,
+        column_index: usize,
+    ) -> Result<Option<ColumnStats>, ColumnarReadError> {
+        let meta = self.chunk_column_meta(chunk_index, column_index)?;
+        let Some(stats) = self.chunk_column_stats(chunk_index, column_index)? else {
+            return Ok(None);
+        };
+        ColumnStats::deserialize(meta.physical_type, stats)
+            .map(Some)
+            .map_err(|source| ColumnarReadError::Stats {
+                column_index,
+                source,
+            })
+    }
+
+    pub fn column_int64_stats(
+        &self,
+        index: usize,
+    ) -> Result<Option<Int64Stats>, ColumnarReadError> {
+        self.chunk_column_int64_stats(0, index)
+    }
+
+    pub fn chunk_column_int64_stats(
+        &self,
+        chunk_index: usize,
+        column_index: usize,
+    ) -> Result<Option<Int64Stats>, ColumnarReadError> {
+        match self.chunk_column_typed_stats(chunk_index, column_index)? {
+            Some(ColumnStats::Int64(stats)) => Ok(Some(stats)),
+            None => Ok(None),
+        }
     }
 
     pub fn column_buffers(
@@ -660,6 +713,15 @@ impl<'a> ColumnarReader<'a> {
         Ok(())
     }
 
+    fn validate_stats_blocks(&self) -> Result<(), ColumnarReadError> {
+        for chunk_index in 0..self.chunk_count {
+            for column_index in 0..self.logical_column_count {
+                let _ = self.chunk_column_typed_stats(chunk_index, column_index)?;
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     pub fn chunk_row_count(&self, chunk_index: usize) -> Result<usize, ColumnarReadError> {
         self.chunk_column_row_count(chunk_index, 0)
@@ -785,9 +847,21 @@ fn usize_range(
 mod tests {
     use super::ColumnarReader;
     use crate::{
-        ColumnMeta, ColumnarWriter, FileHeader, ValueAlignmentStrategy, FILE_HEADER_LEN,
-        MIN_BUFFER_ALIGN, V0_PHYSICAL_FIXED_WIDTH_I64, V0_PHYSICAL_UTF8_I32, VALUES_BUFFER_ALIGN,
+        ColumnMeta, ColumnarReadError, ColumnarWriter, FileHeader, Int64Stats,
+        ValueAlignmentStrategy, FILE_HEADER_LEN, MIN_BUFFER_ALIGN, V0_PHYSICAL_FIXED_WIDTH_I64,
+        V0_PHYSICAL_UTF8_I32, VALUES_BUFFER_ALIGN,
     };
+
+    fn encode_i64(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn encode_stats(stats: Int64Stats) -> [u8; Int64Stats::SERIALIZED_LEN] {
+        stats.serialize()
+    }
 
     #[test]
     fn writer_roundtrip_zero_copy_views() {
@@ -926,6 +1000,95 @@ mod tests {
         assert_eq!(r.chunk_column_values(1, 1).unwrap(), chunk1_col1.as_slice());
         assert_eq!(r.header().logical_column_count(), 2);
         assert_eq!(r.header().chunk_count(), 2);
+    }
+
+    #[test]
+    fn typed_stats_are_read_without_accessing_values_buffer() {
+        let schema = b"ipc-schema-bytes";
+        let values = encode_i64(&[5, 9, 12]);
+        let stats = Int64Stats {
+            min: Some(5),
+            max: Some(12),
+            null_count: 2,
+            distinct_count: Some(3),
+        };
+
+        let mut w = ColumnarWriter::new();
+        w.write_header_placeholder().unwrap();
+        w.write_schema_block(schema).unwrap();
+        w.reserve_column_directory(1).unwrap();
+        w.pad_to_alignment(MIN_BUFFER_ALIGN as usize).unwrap();
+        let (stats_offset, stats_length) =
+            w.write_fixed_width_values(&encode_stats(stats), 8).unwrap();
+        let (data_offset, data_length) = w.write_values_buffer(&values, 8).unwrap();
+
+        let meta = ColumnMeta {
+            column_id: 0,
+            physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
+            logical_type: 0,
+            data_offset,
+            data_length,
+            validity_offset: 0,
+            validity_length: 0,
+            offsets_offset: 0,
+            offsets_length: 0,
+            stats_offset,
+            stats_length,
+        };
+        w.patch_column_directory(std::slice::from_ref(&meta))
+            .unwrap();
+        w.finalize_header().unwrap();
+        let file = w.into_inner();
+
+        let reader = ColumnarReader::new(&file).unwrap();
+        let decoded = reader.column_int64_stats(0).unwrap().expect("stats");
+
+        assert_eq!(decoded, stats);
+        assert_eq!(
+            reader.column_stats(0).unwrap().unwrap().as_ptr(),
+            file[stats_offset as usize..].as_ptr()
+        );
+    }
+
+    #[test]
+    fn malformed_int64_stats_block_is_rejected() {
+        let schema = b"ipc-schema-bytes";
+        let values = encode_i64(&[1, 2, 3]);
+
+        let mut w = ColumnarWriter::new();
+        w.write_header_placeholder().unwrap();
+        w.write_schema_block(schema).unwrap();
+        w.reserve_column_directory(1).unwrap();
+        w.pad_to_alignment(MIN_BUFFER_ALIGN as usize).unwrap();
+        let invalid_stats = [0u8; 16];
+        let (stats_offset, stats_length) = w.write_fixed_width_values(&invalid_stats, 8).unwrap();
+        let (data_offset, data_length) = w.write_values_buffer(&values, 8).unwrap();
+
+        let meta = ColumnMeta {
+            column_id: 0,
+            physical_type: V0_PHYSICAL_FIXED_WIDTH_I64,
+            logical_type: 0,
+            data_offset,
+            data_length,
+            validity_offset: 0,
+            validity_length: 0,
+            offsets_offset: 0,
+            offsets_length: 0,
+            stats_offset,
+            stats_length,
+        };
+        w.patch_column_directory(std::slice::from_ref(&meta))
+            .unwrap();
+        w.finalize_header().unwrap();
+
+        let err = ColumnarReader::new(&w.into_inner()).unwrap_err();
+        assert!(matches!(
+            err,
+            ColumnarReadError::Stats {
+                column_index: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
